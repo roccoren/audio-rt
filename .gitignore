@@ -1,0 +1,118 @@
+.venv/
+env/
+ENV/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Packaging
+MANIFEST
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Django stuff
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff
+instance/
+.webassets-cache
+
+# Scrapy stuff
+.scrapy
+
+# PyBuilder
+target/
+
+# IPython/Jupyter
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+poetry.toml
+
+# PDM
+pdm.lock
+.pdm.toml
+
+# mkdocs
+/site
+
+# mypy
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# VS Code
+.vscode/
+
+# Environment variables
+.env
+.env.*
+!*.env.example
+!.env.template
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node / frontend
+node_modules/
+web/node_modules/
+web/dist/
+yarn.lock
+pnpm-lock.yaml
+package-lock.json
+.npm/
+.yarn/
+.cache/
+
