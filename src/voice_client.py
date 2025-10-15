@@ -4,7 +4,7 @@ import io
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import logging
 import numpy as np
@@ -14,6 +14,70 @@ from openai import AsyncAzureOpenAI
 
 
 DEFAULT_REALTIME_API_VERSION = "2025-08-28"
+
+_DOTENV_CACHE: Optional[Dict[str, str]] = None
+
+
+def _dotenv_path() -> Path:
+    return Path(__file__).resolve().parent.parent / ".env"
+
+
+def _strip_inline_comment(value: str) -> str:
+    stripped: list[str] = []
+    in_single = False
+    in_double = False
+    for char in value:
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            break
+        stripped.append(char)
+    return "".join(stripped).strip()
+
+
+def _load_dotenv() -> Dict[str, str]:
+    global _DOTENV_CACHE
+    if _DOTENV_CACHE is not None:
+        return _DOTENV_CACHE
+
+    env_vars: Dict[str, str] = {}
+    path = _dotenv_path()
+    try:
+        data = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        _DOTENV_CACHE = env_vars
+        return env_vars
+    except OSError as exc:
+        logging.getLogger(__name__).debug("Failed to read .env file: %s", exc)
+        _DOTENV_CACHE = env_vars
+        return env_vars
+
+    for raw_line in data.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        cleaned = _strip_inline_comment(value.strip())
+        if cleaned and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+            cleaned = cleaned[1:-1]
+        env_vars[key] = cleaned
+
+    _DOTENV_CACHE = env_vars
+    return env_vars
+
+
+def _get_env(name: str) -> Optional[str]:
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    return _load_dotenv().get(name)
 
 
 ZARA_INSTRUCTIONS = (
@@ -266,10 +330,10 @@ def load_env_config(
     voice_override: Optional[str] = None,
     api_version_override: Optional[str] = None,
 ) -> AzureVoiceClientConfig:
-    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-    api_key = os.environ.get("AZURE_OPENAI_API_KEY")
-    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-    realtime_host = os.environ.get("AZURE_OPENAI_REALTIME_HOST")
+    endpoint = _get_env("AZURE_OPENAI_ENDPOINT")
+    api_key = _get_env("AZURE_OPENAI_API_KEY")
+    deployment = _get_env("AZURE_OPENAI_DEPLOYMENT")
+    realtime_host = _get_env("AZURE_OPENAI_REALTIME_HOST")
     if not all([endpoint, api_key, deployment]):
         missing = [
             name
@@ -285,7 +349,7 @@ def load_env_config(
     endpoint = _normalize_endpoint(endpoint)
 
     def _int_env(var_name: str, fallback: int) -> int:
-        raw = os.environ.get(var_name)
+        raw = _get_env(var_name)
         if raw is None:
             return fallback
         try:
@@ -294,11 +358,10 @@ def load_env_config(
             raise RuntimeError(f"{var_name} must be an integer, got {raw!r}") from None
 
     sample_rate = sample_rate_override or _int_env("AZURE_OPENAI_SAMPLE_RATE", 24000)
-    voice = voice_override or os.environ.get("AZURE_OPENAI_VOICE", "alloy")
-    api_version = api_version_override or os.environ.get(
+    voice = voice_override or _get_env("AZURE_OPENAI_VOICE") or "alloy"
+    api_version = api_version_override or _get_env(
         "AZURE_OPENAI_API_VERSION",
-        DEFAULT_REALTIME_API_VERSION,
-    )
+    ) or DEFAULT_REALTIME_API_VERSION
 
     return AzureVoiceClientConfig(
         endpoint=endpoint,
