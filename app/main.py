@@ -175,7 +175,9 @@ async def realtime_handshake(payload: RealtimeHandshakeRequest) -> RealtimeHands
         )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Increase timeout for realtime handshake - Azure can be slow to respond
+        timeout_config = httpx.Timeout(60.0, connect=10.0, read=60.0, write=10.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             response = await client.post(
                 config.realtime_host.rstrip("/") + "/v1/realtimertc",
                 headers={
@@ -186,6 +188,12 @@ async def realtime_handshake(payload: RealtimeHandshakeRequest) -> RealtimeHands
                 },
                 content=offer_sdp,
             )
+    except httpx.TimeoutException as exc:
+        logger.exception("Realtime handshake timeout: %s", exc)
+        raise HTTPException(
+            status_code=504,
+            detail=f"Realtime handshake timed out after 60 seconds. The Azure endpoint may be overloaded or unavailable.",
+        ) from exc
     except httpx.HTTPError as exc:
         logger.exception("Realtime handshake request failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Realtime handshake failed: {exc}") from exc

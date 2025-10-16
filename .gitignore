@@ -3,6 +3,12 @@ env/
 ENV/
 venv/
 
+# Custom Audio
+audio/
+*.wav
+cognitive-services-speech-sdk/
+customvoice/
+
 # Python artifacts
 __pycache__/
 *.py[cod]

@@ -18,6 +18,11 @@ This workspace contains a Python service and a modern React web app that talk to
     - `AZURE_OPENAI_VOICE`
     - `AZURE_OPENAI_SAMPLE_RATE`
     - `AZURE_OPENAI_API_VERSION`
+  - Optional personal voice support:
+    - `AZURE_SPEECH_KEY`
+    - `AZURE_SPEECH_REGION`
+    - `AZURE_SPEECH_SPEAKER_PROFILE_ID` (speaker profile created via Azure Personal Voice)
+    - Optional: `AZURE_SPEECH_VOICE_NAME`, `AZURE_SPEECH_VOICE_STYLE`, `AZURE_SPEECH_LANGUAGE`
 
 Install dependencies:
 
@@ -94,10 +99,54 @@ python src/run_zara_voice.py --text "Hey Zara, how are you today?"
 
 Use the `--microphone` flag if you want to capture microphone audio instead of typed text (macOS/Linux only, requires `sounddevice`).
 
+## Azure Personal Voice (Optional)
+
+If you have created a Personal Voice speaker profile via Azure Speech, the backend can synthesize replies with your custom voice instead of an Azure OpenAI stock voice.
+
+1. Provision a Personal Voice speaker profile using the Speech SDK tooling. The helper script `src/personal_voice_setup.py` mirrors the official sample and expects the `customvoice` helpers from the Azure Speech samples repository:
+
+   ```bash
+   git clone https://github.com/Azure-Samples/cognitive-services-speech-sdk.git
+   cp -R cognitive-services-speech-sdk/samples/custom-voice/python/customvoice ./customvoice
+
+   # Create the resources (adjust IDs, paths, names)
+   python src/personal_voice_setup.py create \
+     --project-id personal-voice-project-1 \
+     --consent-id personal-voice-consent-1 \
+     --personal-voice-id personal-voice-1 \
+     --consent-file TestData/VoiceTalentVerbalStatement.wav \
+     --audio-folder TestData/voice \
+     --voice-talent-name "Sample Voice Actor" \
+     --company-name "Contoso"
+
+   # Capture the printed speaker profile id, then you can synthesize test audio
+   python src/personal_voice_setup.py synthesize \
+     --speaker-profile-id <speaker_profile_id> \
+     --text "This is zero shot voice. Test 2." \
+     --output output_sdk.wav
+
+   # Inspect the existing personal voices (set --project-id to narrow results)
+   python src/personal_voice_setup.py list --json
+   ```
+
+2. Set these environment variables before starting the FastAPI service:
+
+   ```bash
+   export AZURE_SPEECH_KEY="..."
+   export AZURE_SPEECH_REGION="eastus"
+   export AZURE_SPEECH_SPEAKER_PROFILE_ID="<speaker_profile_id>"
+   export AZURE_SPEECH_VOICE_NAME="DragonLatestNeural"   # optional override
+   export AZURE_SPEECH_VOICE_STYLE="Prompt"              # optional override
+   export AZURE_SPEECH_LANGUAGE="en-US"                  # optional override
+   ```
+
+With the values in place, every reply streamed from Azure OpenAI is re-synthesized locally using the Personal Voice speaker profile before being returned to the browser/CLI. Remove or unset the speech environment variables to fall back to the stock Azure OpenAI voices.
+
 ## Files
 
 - `src/voice_client.py` – Azure Voice Live WebSocket client
 - `src/run_zara_voice.py` – CLI entry point
+- `src/personal_voice_setup.py` – helper to create/manage Azure Personal Voice assets
 - `app/main.py` – FastAPI bridge between browser and Azure OpenAI
 - `requirements.txt` – Python dependencies
 - `web/` – React + Vite application for audio chat

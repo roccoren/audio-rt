@@ -1,7 +1,10 @@
+import asyncio
 import base64
 import datetime as dt
+import functools
 import io
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
@@ -9,6 +12,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import logging
 import numpy as np
 import wave
+from xml.sax.saxutils import escape as xml_escape
 
 from openai import AsyncAzureOpenAI
 
@@ -80,6 +84,28 @@ def _get_env(name: str) -> Optional[str]:
     return _load_dotenv().get(name)
 
 
+def _extract_text_from_response_payload(payload: dict) -> list[str]:
+    segments: list[str] = []
+    if not isinstance(payload, dict):
+        return segments
+    outputs = payload.get("output")
+    if isinstance(outputs, list):
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            content_items = output.get("content")
+            if not isinstance(content_items, list):
+                continue
+            for item in content_items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                text_value = item.get("text")
+                if item_type in {"output_text", "text"} and isinstance(text_value, str):
+                    segments.append(text_value)
+    return segments
+
+
 ZARA_INSTRUCTIONS = (
     "You are Zara, a human like AI character developed in twenty twenty five. "
     "You are a good listener and a concise communicator. You believe in nuance as a guiding principle. "
@@ -109,6 +135,121 @@ class AzureVoiceClientError(RuntimeError):
     """Raised when the Azure Voice Live API responds with an error message."""
 
 
+class PersonalVoiceError(RuntimeError):
+    """Raised when Azure Personal Voice synthesis fails."""
+
+
+@dataclass
+class PersonalVoiceConfig:
+    speech_key: str
+    speech_region: str
+    speaker_profile_id: str
+    voice_name: str = "DragonLatestNeural"
+    style: Optional[str] = "Prompt"
+    language: str = "en-US"
+
+    def build_ssml(self, text: str, base_voice_override: Optional[str] = None) -> str:
+        """Construct the SSML payload for a personal voice synthesis request."""
+        if not text.strip():
+            raise PersonalVoiceError("Cannot synthesize empty text with personal voice.")
+        voice_name = (base_voice_override or self.voice_name or "").strip()
+        if not voice_name:
+            raise PersonalVoiceError("A base voice name (e.g. DragonLatestNeural) is required for personal voice.")
+
+        escaped_text = xml_escape(text)
+        ssml_parts = [
+            "<speak version='1.0' xml:lang='{lang}' xmlns='http://www.w3.org/2001/10/synthesis' "
+            "xmlns:mstts='http://www.w3.org/2001/mstts'>".format(lang=self.language),
+            "<voice name='{name}'>".format(name=voice_name),
+            "<mstts:ttsembedding speakerProfileId='{profile}'/>".format(profile=self.speaker_profile_id),
+        ]
+        if self.style:
+            ssml_parts.append("<mstts:express-as style='{style}'>".format(style=self.style))
+        ssml_parts.append("<lang xml:lang='{lang}'>{text}</lang>".format(lang=self.language, text=escaped_text))
+        if self.style:
+            ssml_parts.append("</mstts:express-as>")
+        ssml_parts.append("</voice></speak>")
+        return "".join(ssml_parts)
+
+
+class PersonalVoiceSynthesizer:
+    """Helper that turns text into PCM audio using Azure Personal Voice."""
+
+    def __init__(self, config: PersonalVoiceConfig, sample_rate_hz: int, *, logger: logging.Logger):
+        self._config = config
+        self._sample_rate = sample_rate_hz
+        self._logger = logger.getChild("PersonalVoice")
+        self._speechsdk = None
+
+    def _ensure_speechsdk(self):
+        if self._speechsdk is not None:
+            return self._speechsdk
+        try:
+            import azure.cognitiveservices.speech as speechsdk  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - dependency error
+            raise PersonalVoiceError(
+                "azure-cognitiveservices-speech is required to synthesize personal voice audio."
+            ) from exc
+        self._speechsdk = speechsdk
+        return speechsdk
+
+    def _resolve_output_format(self, speechsdk):
+        mapping = {
+            16000: speechsdk.SpeechSynthesisOutputFormat.Raw16Khz16BitMonoPcm,
+            24000: speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm,
+            48000: speechsdk.SpeechSynthesisOutputFormat.Raw48Khz16BitMonoPcm,
+        }
+        if self._sample_rate not in mapping:
+            raise PersonalVoiceError(
+                f"Sample rate {self._sample_rate} Hz is not supported for raw PCM synthesis by Azure Speech."
+            )
+        return mapping[self._sample_rate]
+
+    def _synthesize_blocking(self, text: str, base_voice_override: Optional[str]) -> bytes:
+        speechsdk = self._ensure_speechsdk()
+        speech_config = speechsdk.SpeechConfig(
+            subscription=self._config.speech_key,
+            region=self._config.speech_region,
+        )
+        speech_config.set_speech_synthesis_output_format(self._resolve_output_format(speechsdk))
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pcm")
+        os.close(tmp_fd)
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=tmp_path)
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+
+        ssml = self._config.build_ssml(text, base_voice_override=base_voice_override)
+        try:
+            result = synthesizer.speak_ssml_async(ssml).get()
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                try:
+                    audio_data = Path(tmp_path).read_bytes()
+                except OSError as exc:
+                    raise PersonalVoiceError(f"Failed to read synthesized audio: {exc}") from exc
+                if not audio_data:
+                    audio_data = result.audio_data or b""
+                if not audio_data:
+                    raise PersonalVoiceError("Personal voice synthesis returned no audio bytes.")
+                return bytes(audio_data)
+            if result.reason == speechsdk.ResultReason.Canceled:
+                details = result.cancellation_details
+                message = details.error_details or str(details.reason)
+                raise PersonalVoiceError(f"Personal voice synthesis canceled: {message}")
+            raise PersonalVoiceError(f"Unexpected personal voice synthesis result: {result.reason}")
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    async def synthesize(self, text: str, *, base_voice_override: Optional[str]) -> bytes:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            functools.partial(self._synthesize_blocking, text, base_voice_override),
+        )
+
+
 @dataclass
 class AzureVoiceClientConfig:
     endpoint: str
@@ -118,6 +259,7 @@ class AzureVoiceClientConfig:
     voice: str = "alloy"
     sample_rate_hz: int = 24000
     realtime_host: Optional[str] = None
+    personal_voice: Optional[PersonalVoiceConfig] = None
 
 
 class AzureVoiceClient:
@@ -126,6 +268,18 @@ class AzureVoiceClient:
     def __init__(self, config: AzureVoiceClientConfig):
         self.config = config
         self._logger = logging.getLogger(__name__)
+        self._personal_voice_synthesizer: Optional[PersonalVoiceSynthesizer] = None
+
+    def _get_personal_voice_synthesizer(self) -> Optional[PersonalVoiceSynthesizer]:
+        if not self.config.personal_voice:
+            return None
+        if self._personal_voice_synthesizer is None:
+            self._personal_voice_synthesizer = PersonalVoiceSynthesizer(
+                self.config.personal_voice,
+                self.config.sample_rate_hz,
+                logger=self._logger,
+            )
+        return self._personal_voice_synthesizer
 
     async def generate_reply(
         self,
@@ -138,7 +292,12 @@ class AzureVoiceClient:
         if not user_text and not input_audio_chunks:
             raise ValueError("Either user_text or input_audio_chunks must be provided.")
 
-        voice_name = voice or self.config.voice
+        personal_voice_synth = self._get_personal_voice_synthesizer()
+        voice_override = (voice or "").strip() or None
+
+        voice_name = voice_override or self.config.voice
+        realtime_output_modalities = ["audio", "text"] if personal_voice_synth is None else ["text"]
+
         client = AsyncAzureOpenAI(
             azure_endpoint=self.config.endpoint,
             api_key=self.config.api_key,
@@ -147,7 +306,12 @@ class AzureVoiceClient:
 
         try:
             async with client.beta.realtime.connect(model=self.config.deployment) as connection:
-                await self._configure_session(connection, instructions=instructions, voice=voice_name)
+                await self._configure_session(
+                    connection,
+                    instructions=instructions,
+                    output_modalities=realtime_output_modalities,
+                    voice_name=None if personal_voice_synth else voice_name,
+                )
 
                 if user_text:
                     await self._send_user_text(connection, user_text)
@@ -157,12 +321,14 @@ class AzureVoiceClient:
 
                 await connection.response.create(
                     response={
-                        "output_modalities": ["audio"],
+                        "modalities": list(dict.fromkeys(realtime_output_modalities)),
+                        **({"voice": voice_name} if not personal_voice_synth and voice_name else {}),
                     }
                 )
 
                 collected_audio = bytearray()
                 collected_text: list[str] = []
+                final_text_segments: list[str] = []
 
                 async for event in connection:
                     event_type = getattr(event, "type", None)
@@ -178,6 +344,8 @@ class AzureVoiceClient:
                         "response.audio.delta",
                         "response.output_audio.delta",
                     }:
+                        if personal_voice_synth is not None:
+                            continue
                         delta = getattr(event, "delta", None)
                         if delta:
                             collected_audio.extend(base64.b64decode(delta))
@@ -188,6 +356,8 @@ class AzureVoiceClient:
                     }:
                         continue
                     elif event_type == "response.done":
+                        response_payload = getattr(event, "response", None)
+                        final_text_segments.extend(_extract_text_from_response_payload(response_payload))
                         break
                     elif event_type in {"response.error", "error"}:
                         error_payload = getattr(event, "error", None)
@@ -200,26 +370,53 @@ class AzureVoiceClient:
                     else:
                         self._logger.debug("Unhandled realtime event: %s", event_type)
 
+                transcript = "".join(collected_text).strip()
+                if not transcript and final_text_segments:
+                    transcript = "".join(final_text_segments).strip()
+                if transcript:
+                    self._logger.debug("Collected transcript from realtime response: %s", transcript)
+                if personal_voice_synth is not None:
+                    if not transcript:
+                        raise AzureVoiceClientError(
+                            "Realtime API returned no text to synthesize with the personal voice."
+                        )
+                    base_voice = voice_override or self.config.personal_voice.voice_name
+                    try:
+                        audio_bytes = await personal_voice_synth.synthesize(
+                            transcript,
+                            base_voice_override=base_voice,
+                        )
+                    except PersonalVoiceError as exc:
+                        self._logger.error("Personal voice synthesis failed: %s", exc)
+                        raise AzureVoiceClientError(str(exc)) from exc
+                    return transcript, audio_bytes
+
                 audio_bytes = bytes(collected_audio)
                 if not audio_bytes:
                     message = "Realtime API returned no audio in the response."
                     self._logger.error(message)
                     raise AzureVoiceClientError(message)
-                transcript = "".join(collected_text).strip()
-                if transcript:
-                    self._logger.debug("Collected transcript from realtime response: %s", transcript)
                 return transcript, audio_bytes
         finally:
             await client.close()
 
-    async def _configure_session(self, connection, *, instructions: str, voice: str) -> None:
-        await connection.session.update(
-            session={
-                "type": "realtime",
-                "instructions": instructions,
-                "output_modalities": ["audio"],
-            }
-        )
+    async def _configure_session(
+        self,
+        connection,
+        *,
+        instructions: str,
+        output_modalities: Sequence[str],
+        voice_name: Optional[str],
+    ) -> None:
+        session_payload: dict[str, object] = {
+            "instructions": instructions,
+        }
+        modalities = list(dict.fromkeys(output_modalities))
+        if modalities:
+            session_payload["modalities"] = modalities
+        if voice_name:
+            session_payload["voice"] = voice_name
+        await connection.session.update(session=session_payload)
 
     async def _send_user_text(self, connection, text: str) -> None:
         await connection.conversation.item.create(
@@ -359,6 +556,38 @@ def load_env_config(
         "AZURE_OPENAI_API_VERSION",
     ) or DEFAULT_REALTIME_API_VERSION
 
+    speech_key = _get_env("AZURE_SPEECH_KEY")
+    speech_region = _get_env("AZURE_SPEECH_REGION")
+    speaker_profile_id = (
+        _get_env("AZURE_SPEECH_SPEAKER_PROFILE_ID")
+        or _get_env("AZURE_PERSONAL_VOICE_SPEAKER_PROFILE_ID")
+        or _get_env("AZURE_PERSONAL_VOICE_ID")
+    )
+    personal_voice: Optional[PersonalVoiceConfig] = None
+    if any([speech_key, speech_region, speaker_profile_id]):
+        missing = [
+            name
+            for name, value in [
+                ("AZURE_SPEECH_KEY", speech_key),
+                ("AZURE_SPEECH_REGION", speech_region),
+                ("AZURE_SPEECH_SPEAKER_PROFILE_ID", speaker_profile_id),
+            ]
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "Personal voice configuration is incomplete. Set the following environment variable(s): "
+                + ", ".join(missing)
+            )
+        personal_voice = PersonalVoiceConfig(
+            speech_key=speech_key,
+            speech_region=speech_region,
+            speaker_profile_id=speaker_profile_id,
+            voice_name=_get_env("AZURE_SPEECH_VOICE_NAME") or "DragonLatestNeural",
+            style=_get_env("AZURE_SPEECH_VOICE_STYLE") or "Prompt",
+            language=_get_env("AZURE_SPEECH_LANGUAGE") or "en-US",
+        )
+
     return AzureVoiceClientConfig(
         endpoint=endpoint,
         api_key=api_key,
@@ -367,4 +596,5 @@ def load_env_config(
         voice=voice,
         api_version=api_version,
         realtime_host=realtime_host,
+        personal_voice=personal_voice,
     )
