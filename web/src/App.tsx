@@ -4,6 +4,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000
 const TARGET_SAMPLE_RATE = 24000;
 
 type ConversationMode = "text" | "voice" | "call";
+type CallTransport = "webrtc" | "websocket";
 
 const MODE_OPTIONS: Array<{ value: ConversationMode; label: string; description: string }> = [
   { value: "text", label: "文字 → 语音", description: "键入内容，Zara 用语音回复。" },
@@ -41,6 +42,8 @@ type RealtimeSessionInfo = {
   clientSecret: string;
   iceServers: RTCIceServer[];
   sessionId: string;
+  wsUrl?: string | null;
+  wsProtocols?: string[] | null;
 };
 
 const ZARA_INSTRUCTIONS =
@@ -65,6 +68,11 @@ const ZARA_INSTRUCTIONS =
   "Ask for clarification when a request is unclear. If you do not know something, say so without apology. " +
   "Admit quickly if you hallucinate. Avoid unwarranted praise and ungrounded superlatives. " +
   "Contribute new insights instead of echoing the user. Only include words for speech in each response.";
+
+const STREAM_BUFFER_SIZE = 4096;
+const SILENCE_THRESHOLD = 0.015;
+const SILENCE_DURATION_MS = 750;
+const TEXT_DECODER = new TextDecoder();
 
 function uuid() {
   return crypto.randomUUID();
@@ -157,8 +165,37 @@ function base64ToBlob(base64: string, mimeType: string): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function pcm16BytesToFloat32(bytes: Uint8Array): Float32Array {
+  const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32767;
+  }
+  return float32;
+}
+
+function calculateRms(samples: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const sample = samples[i];
+    sum += sample * sample;
+  }
+  return Math.sqrt(sum / samples.length);
+}
+
 export default function App(): JSX.Element {
   const [mode, setMode] = useState<ConversationMode>("voice");
+  const [callTransport, setCallTransport] = useState<CallTransport>("webrtc");
   const [text, setText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [capturedAudio, setCapturedAudio] = useState<CapturedAudio | null>(null);
@@ -175,6 +212,15 @@ export default function App(): JSX.Element {
   const callPeerRef = useRef<RTCPeerConnection | null>(null);
   const callLocalStreamRef = useRef<MediaStream | null>(null);
   const sessionInfoRef = useRef<RealtimeSessionInfo | null>(null);
+  const callSocketRef = useRef<WebSocket | null>(null);
+  const callAudioContextRef = useRef<AudioContext | null>(null);
+  const callProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const callDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const callPlaybackTimeRef = useRef<number>(0);
+  const callStreamingStateRef = useRef<"idle" | "speaking" | "awaiting_response">("idle");
+  const callLastVoiceActivityRef = useRef<number>(performance.now());
+  const callAwaitingResponseRef = useRef(false);
+  const callHasSpeechSinceCommitRef = useRef(false);
 
   const awaitIceGatheringComplete = useCallback(
     (peer: RTCPeerConnection) =>
@@ -274,7 +320,15 @@ export default function App(): JSX.Element {
     };
   }, [history]);
 
-  const stopCall = useCallback(() => {
+  const resetRealtimeState = useCallback(() => {
+    sessionInfoRef.current = null;
+    callAwaitingResponseRef.current = false;
+    callHasSpeechSinceCommitRef.current = false;
+    callStreamingStateRef.current = "idle";
+    callPlaybackTimeRef.current = 0;
+  }, []);
+
+  const stopWebrtcCall = useCallback(() => {
     const peer = callPeerRef.current;
     if (peer) {
       peer.ontrack = null;
@@ -289,10 +343,54 @@ export default function App(): JSX.Element {
     }
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
+      remoteAudioRef.current.pause();
+    }
+  }, []);
+
+  const stopWebsocketCall = useCallback(() => {
+    const socket = callSocketRef.current;
+    if (socket) {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close(1000, "client_closed");
+      }
+      callSocketRef.current = null;
+    }
+    const processor = callProcessorRef.current;
+    if (processor) {
+      processor.onaudioprocess = null;
+      processor.disconnect();
+      callProcessorRef.current = null;
+    }
+    const destination = callDestinationRef.current;
+    if (destination) {
+      destination.disconnect();
+      callDestinationRef.current = null;
+    }
+    const audioContext = callAudioContextRef.current;
+    if (audioContext) {
+      audioContext.close().catch(() => undefined);
+      callAudioContextRef.current = null;
+    }
+    const stream = callLocalStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      callLocalStreamRef.current = null;
+    }
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = null;
+      remoteAudioRef.current.pause();
+    }
+  }, []);
+
+  const stopCall = useCallback(() => {
+    if (callTransport === "webrtc") {
+      stopWebrtcCall();
+    } else {
+      stopWebsocketCall();
     }
     setCallStatus("idle");
-    sessionInfoRef.current = null;
-  }, []);
+    resetRealtimeState();
+  }, [callTransport, resetRealtimeState, stopWebrtcCall, stopWebsocketCall]);
 
   const stopRecorder = useCallback(() => {
     if (recorderRef.current && recorderRef.current.state !== "inactive") {
@@ -388,7 +486,7 @@ export default function App(): JSX.Element {
     [],
   );
 
-  const startCall = useCallback(async () => {
+  const startWebrtcCall = useCallback(async () => {
     if (callStatus !== "idle") {
       return;
     }
@@ -442,19 +540,16 @@ export default function App(): JSX.Element {
         const sessionUpdate = {
           type: "session.update",
           session: {
+            type: "realtime",
             instructions: ZARA_INSTRUCTIONS,
-            voice: "alloy",
-            modalities: ["audio", "text"],
-            input_audio_format: "pcm16",
-            output_audio_format: "pcm16",
+            output_modalities: ["audio"],
           },
         };
         eventsChannel.send(JSON.stringify(sessionUpdate));
         const responseCreate = {
           type: "response.create",
           response: {
-            modalities: ["audio"],
-            instructions: ZARA_INSTRUCTIONS,
+            output_modalities: ["audio"],
           },
         };
         eventsChannel.send(JSON.stringify(responseCreate));
@@ -485,14 +580,18 @@ export default function App(): JSX.Element {
         console.debug("iceconnectionstatechange", peer.iceConnectionState);
         if (peer.iceConnectionState === "failed") {
           console.error("ICE connection failed, stopping call.");
-          stopCall();
+          stopWebrtcCall();
+          setCallStatus("idle");
+          resetRealtimeState();
         }
       });
       peer.addEventListener("connectionstatechange", () => {
         console.debug("peer connection state", peer.connectionState);
         const state = peer.connectionState;
         if (state === "failed" || state === "closed") {
-          stopCall();
+          stopWebrtcCall();
+          setCallStatus("idle");
+          resetRealtimeState();
         }
       });
 
@@ -570,9 +669,304 @@ export default function App(): JSX.Element {
     } catch (callError) {
       console.error(callError);
       setError("实时通话连接失败，请稍后再试。");
-      stopCall();
+      stopWebrtcCall();
+      setCallStatus("idle");
+      resetRealtimeState();
     }
-  }, [callStatus, stopCall]);
+  }, [awaitIceGatheringComplete, callStatus, resetRealtimeState, stopWebrtcCall]);
+
+  const handleRealtimeWsEvent = useCallback(
+    (payload: unknown) => {
+      if (payload === null || typeof payload !== "object") {
+        return;
+      }
+      const event = payload as { type?: string; delta?: string; error?: { message?: string }; message?: string };
+      const eventType = event.type;
+      if (!eventType) {
+        return;
+      }
+      if (eventType === "response.audio.delta" || eventType === "response.output_audio.delta") {
+        const delta = event.delta;
+        if (!delta) {
+          return;
+        }
+        const audioContext = callAudioContextRef.current;
+        const destination = callDestinationRef.current;
+        if (!audioContext || !destination) {
+          return;
+        }
+        const pcmBytes = base64ToUint8Array(delta);
+        if (!pcmBytes.length) {
+          return;
+        }
+        const float32 = pcm16BytesToFloat32(pcmBytes);
+        if (!float32.length) {
+          return;
+        }
+        const buffer = audioContext.createBuffer(1, float32.length, TARGET_SAMPLE_RATE);
+        buffer.copyToChannel(float32, 0);
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(destination);
+        const startAt = Math.max(callPlaybackTimeRef.current, audioContext.currentTime);
+        source.start(startAt);
+        callPlaybackTimeRef.current = startAt + buffer.duration;
+      } else if (eventType === "response.completed" || eventType === "response.done") {
+        callAwaitingResponseRef.current = false;
+        callStreamingStateRef.current = "idle";
+        callHasSpeechSinceCommitRef.current = false;
+      } else if (eventType === "response.error" || eventType === "error") {
+        const message = event.error?.message ?? event.message ?? "Realtime response error.";
+        console.error("Realtime response error", message, payload);
+        setError("实时通话连接失败，请稍后再试。");
+      } else if (!eventType.startsWith("input_audio_buffer.") && !eventType.startsWith("session.")) {
+        console.debug("Unhandled realtime event", payload);
+      }
+    },
+    [setError],
+  );
+
+  const startWebsocketCall = useCallback(async () => {
+    if (callStatus !== "idle") {
+      return;
+    }
+    setError(null);
+    setCallStatus("connecting");
+    try {
+      const sessionResponse = await fetch(`${API_BASE_URL}/api/realtime/session`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          instructions: ZARA_INSTRUCTIONS,
+        }),
+      });
+      if (!sessionResponse.ok) {
+        const message = await sessionResponse.text();
+        throw new Error(message || "Failed to create realtime session.");
+      }
+      const sessionInfo = (await sessionResponse.json()) as RealtimeSessionInfo;
+      console.debug("Realtime session info", sessionInfo);
+      sessionInfoRef.current = sessionInfo;
+      if (!sessionInfo.clientSecret) {
+        throw new Error("Realtime session missing client secret.");
+      }
+      if (!sessionInfo.wsUrl) {
+        throw new Error("Realtime session missing websocket URL.");
+      }
+
+      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      callLocalStreamRef.current = localStream;
+
+      let createdAudioContext: AudioContext | null = null;
+      try {
+        createdAudioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      } catch (audioContextError) {
+        console.warn("Falling back to default AudioContext sample rate.", audioContextError);
+        createdAudioContext = new AudioContext();
+      }
+      const audioContext = createdAudioContext;
+      callAudioContextRef.current = audioContext;
+      callPlaybackTimeRef.current = audioContext.currentTime;
+      callStreamingStateRef.current = "idle";
+      callAwaitingResponseRef.current = false;
+      callHasSpeechSinceCommitRef.current = false;
+      callLastVoiceActivityRef.current = performance.now();
+
+      try {
+        await audioContext.resume();
+      } catch {
+        /* resume failures can be ignored */
+      }
+
+      const source = audioContext.createMediaStreamSource(localStream);
+      const processor = audioContext.createScriptProcessor(STREAM_BUFFER_SIZE, source.channelCount, 1);
+      callProcessorRef.current = processor;
+      const silenceGain = audioContext.createGain();
+      silenceGain.gain.value = 0;
+      processor.connect(silenceGain);
+      silenceGain.connect(audioContext.destination);
+      source.connect(processor);
+
+      const destination = audioContext.createMediaStreamDestination();
+      callDestinationRef.current = destination;
+
+      const remoteAudio = remoteAudioRef.current;
+      if (remoteAudio) {
+        remoteAudio.srcObject = destination.stream;
+        remoteAudio.muted = false;
+        try {
+          await remoteAudio.play();
+        } catch {
+          /* ignore autoplay issues */
+        }
+      }
+
+      const clientSecret = sessionInfo.clientSecret;
+      const baseProtocols: string[] = [];
+      const ensureSecret = (base: string) => `${base}.${clientSecret}`;
+
+      baseProtocols.push("realtime");
+      baseProtocols.push(ensureSecret("openai-ephemeral-key-v1"));
+      baseProtocols.push(ensureSecret("openai-insecure-session-token-v1"));
+
+      const dynamicProtocols: string[] = [];
+      if (sessionInfo.wsProtocols && sessionInfo.wsProtocols.length > 0) {
+        sessionInfo.wsProtocols.forEach((rawProtocol) => {
+          if (typeof rawProtocol !== "string") {
+            return;
+          }
+          let normalized = rawProtocol.replace("{SESSION_SECRET}", clientSecret);
+          if (normalized === "openai-ephemeral-key-v1") {
+            normalized = ensureSecret("openai-ephemeral-key-v1");
+          } else if (normalized === "realtime") {
+            normalized = "realtime";
+          }
+          const trimmed = normalized.trim();
+          if (trimmed) {
+            dynamicProtocols.push(trimmed);
+          }
+        });
+      }
+
+      const wsProtocols = [...baseProtocols, ...dynamicProtocols.filter((value) => !baseProtocols.includes(value))];
+      console.debug("Realtime websocket url", sessionInfo.wsUrl);
+      console.debug("Realtime websocket protocols", wsProtocols);
+      const ws = new WebSocket(sessionInfo.wsUrl, wsProtocols);
+      callSocketRef.current = ws;
+
+      const teardown = () => {
+        stopWebsocketCall();
+        setCallStatus("idle");
+        resetRealtimeState();
+      };
+
+      ws.addEventListener("open", () => {
+        const sessionUpdate = {
+          type: "session.update",
+          session: {
+            type: "realtime",
+            instructions: ZARA_INSTRUCTIONS,
+            output_modalities: ["audio"],
+          },
+        };
+        ws.send(JSON.stringify(sessionUpdate));
+        setCallStatus("connected");
+        console.debug("Realtime websocket connected.");
+      });
+
+      ws.binaryType = "arraybuffer";
+      ws.addEventListener("message", async (event) => {
+        try {
+          let rawText: string | null = null;
+          if (typeof event.data === "string") {
+            rawText = event.data;
+          } else if (event.data instanceof ArrayBuffer) {
+            rawText = TEXT_DECODER.decode(event.data);
+          } else if (event.data instanceof Blob) {
+            rawText = await event.data.text();
+          }
+          if (!rawText) {
+            console.debug("Realtime websocket received unsupported message", event.data);
+            return;
+          }
+          const payload = JSON.parse(rawText) as unknown;
+          handleRealtimeWsEvent(payload);
+        } catch (parseError) {
+          console.debug("Realtime websocket raw message", event.data, parseError);
+        }
+      });
+
+      ws.addEventListener("error", (event) => {
+        console.error("Realtime websocket error", event);
+        setError("实时通话连接出现异常，请稍后再试。");
+      });
+
+      ws.addEventListener("close", (event) => {
+        console.debug("Realtime websocket closed", event.code, event.reason);
+        if (event.code !== 1000) {
+          const reason = event.reason || `code ${event.code}`;
+          setError(`实时通话连接已断开（${reason}）。`);
+        }
+        teardown();
+      });
+
+      processor.onaudioprocess = (audioEvent: AudioProcessingEvent) => {
+        const { inputBuffer } = audioEvent;
+        const frameLength = inputBuffer.length;
+        if (!frameLength) {
+          return;
+        }
+        const channelCount = inputBuffer.numberOfChannels;
+        const mixed = new Float32Array(frameLength);
+        for (let channel = 0; channel < channelCount; channel++) {
+          const channelData = inputBuffer.getChannelData(channel);
+          for (let i = 0; i < frameLength; i++) {
+            mixed[i] += channelData[i];
+          }
+        }
+        if (channelCount > 1) {
+          for (let i = 0; i < frameLength; i++) {
+            mixed[i] /= channelCount;
+          }
+        }
+
+        const rms = calculateRms(mixed);
+        const resampled = resample(mixed, audioContext.sampleRate, TARGET_SAMPLE_RATE);
+        if (!resampled.length) {
+          return;
+        }
+        const pcm16 = floatTo16BitPCM(resampled);
+        if (!pcm16.length || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        const chunkBase64 = uint8ToBase64(new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength));
+        ws.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: chunkBase64,
+          }),
+        );
+        console.debug("Appended audio chunk", {
+          chunkMs: ((pcm16.length / TARGET_SAMPLE_RATE) * 1000).toFixed(2),
+          rms,
+        });
+
+        const now = performance.now();
+        if (rms > SILENCE_THRESHOLD) {
+          callLastVoiceActivityRef.current = now;
+          callHasSpeechSinceCommitRef.current = true;
+          if (callStreamingStateRef.current !== "speaking") {
+            callStreamingStateRef.current = "speaking";
+          }
+        } else if (callStreamingStateRef.current === "speaking") {
+          if (now - callLastVoiceActivityRef.current >= SILENCE_DURATION_MS) {
+            if (!callAwaitingResponseRef.current && callHasSpeechSinceCommitRef.current) {
+              callStreamingStateRef.current = "awaiting_response";
+              callAwaitingResponseRef.current = true;
+              callHasSpeechSinceCommitRef.current = false;
+            }
+          }
+        }
+      };
+    } catch (callError) {
+      console.error(callError);
+      setError("实时通话连接失败，请稍后再试。");
+      stopWebsocketCall();
+      setCallStatus("idle");
+      resetRealtimeState();
+    }
+  }, [callStatus, handleRealtimeWsEvent, resetRealtimeState, stopWebsocketCall]);
+
+  const startCall = useCallback(async () => {
+    if (callTransport === "webrtc") {
+      await startWebrtcCall();
+    } else {
+      await startWebsocketCall();
+    }
+  }, [callTransport, startWebrtcCall, startWebsocketCall]);
 
   const callActive = callStatus === "connected" || callStatus === "connecting";
 
@@ -596,7 +990,6 @@ export default function App(): JSX.Element {
     }
     if (mode !== "call" && callActive) {
       stopCall();
-      sessionInfoRef.current = null;
     }
   }, [callActive, capturedAudio, isRecording, mode, stopCall, stopRecorder]);
 
@@ -673,6 +1066,10 @@ export default function App(): JSX.Element {
 
   const handleModeChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     setMode(event.target.value as ConversationMode);
+  }, []);
+
+  const handleTransportChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setCallTransport(event.target.value as CallTransport);
   }, []);
 
   const hasPendingActions =
@@ -771,6 +1168,36 @@ export default function App(): JSX.Element {
 
           {mode === "call" && (
             <>
+              <div
+                className="transport-options"
+                style={{ display: "flex", gap: "1rem", alignItems: "center", marginBottom: "0.75rem" }}
+              >
+                <span className="transport-label" style={{ fontWeight: 600 }}>
+                  连接方式
+                </span>
+                <label className="transport-option" style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+                  <input
+                    type="radio"
+                    name="call-transport"
+                    value="webrtc"
+                    checked={callTransport === "webrtc"}
+                    onChange={handleTransportChange}
+                    disabled={callActive}
+                  />
+                  <span>WebRTC</span>
+                </label>
+                <label className="transport-option" style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+                  <input
+                    type="radio"
+                    name="call-transport"
+                    value="websocket"
+                    checked={callTransport === "websocket"}
+                    onChange={handleTransportChange}
+                    disabled={callActive}
+                  />
+                  <span>WebSocket</span>
+                </label>
+              </div>
               <div className="button-row">
                 <button
                   type="button"

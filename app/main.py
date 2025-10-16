@@ -2,6 +2,7 @@ import base64
 import binascii
 import logging
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -74,6 +75,26 @@ class RealtimeSessionResponse(BaseModel):
         default_factory=list,
         alias="iceServers",
         description="ICE servers that should be used when constructing the RTCPeerConnection.",
+    )
+    sdp_url: Optional[str] = Field(
+        default=None,
+        alias="sdpUrl",
+        description="RTC handshake endpoint for WebRTC clients.",
+    )
+    ws_url: Optional[str] = Field(
+        default=None,
+        alias="wsUrl",
+        description="WebSocket endpoint (including query) for realtime clients.",
+    )
+    ws_protocols: Optional[list[str]] = Field(
+        default=None,
+        alias="wsProtocols",
+        description="Optional list of WebSocket subprotocols recommended by Azure.",
+    )
+    session_expires_at: Optional[str] = Field(
+        default=None,
+        alias="sessionExpiresAt",
+        description="Expiry for the realtime session itself when provided by Azure.",
     )
 
 
@@ -250,7 +271,12 @@ async def realtime_session(payload: RealtimeSessionRequest) -> RealtimeSessionRe
     client_secret = ""
     client_secret_payload = session_info.get("client_secret")
     if isinstance(client_secret_payload, dict):
-        client_secret = client_secret_payload.get("value", "")
+        client_secret = (
+            client_secret_payload.get("value")
+            or client_secret_payload.get("secret")
+            or client_secret_payload.get("client_secret")
+            or ""
+        )
         expires_at = client_secret_payload.get("expires_at")
     elif isinstance(client_secret_payload, str):
         client_secret = client_secret_payload
@@ -264,6 +290,21 @@ async def realtime_session(payload: RealtimeSessionRequest) -> RealtimeSessionRe
 
     ice_servers = session_info.get("ice_servers", []) or []
     session_id = session_info.get("id", "")
+    session_expires_at = session_info.get("expires_at")
+    webrtc_info = session_info.get("webrtc") or {}
+    websocket_url = session_info.get("websocket_url") or session_info.get("ws_url")
+    websocket_info = session_info.get("websocket") or {}
+    if isinstance(websocket_info, dict):
+        websocket_url = websocket_url or websocket_info.get("url") or websocket_info.get("value")
+        websocket_protocols = websocket_info.get("protocols")
+        if isinstance(websocket_protocols, list):
+            websocket_protocols = [str(item) for item in websocket_protocols if isinstance(item, (str, bytes))]
+        else:
+            websocket_protocols = None
+    else:
+        websocket_protocols = None
+    if isinstance(websocket_url, dict):
+        websocket_url = websocket_url.get("url") or websocket_url.get("value")
 
     expires_value: Optional[str]
     if expires_at is None:
@@ -271,10 +312,75 @@ async def realtime_session(payload: RealtimeSessionRequest) -> RealtimeSessionRe
     else:
         expires_value = str(expires_at)
 
+    endpoint_lower = (config.endpoint or "").lower()
+    if config.endpoint.startswith("http://"):
+        ws_scheme = "ws://"
+        ws_base = config.endpoint[len("http://") :]
+    elif config.endpoint.startswith("https://"):
+        ws_scheme = "wss://"
+        ws_base = config.endpoint[len("https://") :]
+    else:
+        ws_scheme = "wss://"
+        ws_base = config.endpoint
+
+    is_azure_resource = "openai.azure.com" in endpoint_lower
+    ws_path = "/openai/v1/realtime" if is_azure_resource else "/v1/realtime"
+
+    ws_query_params: dict[str, str] = {}
+    if is_azure_resource:
+        ws_query_params["deployment"] = config.deployment
+    else:
+        ws_query_params["model"] = config.deployment
+    if is_azure_resource:
+        ws_query_params["model"] = config.deployment
+        if config.api_key:
+            ws_query_params["api-key"] = config.api_key
+    if session_id:
+        ws_query_params.setdefault("session", session_id)
+    if config.api_version:
+        ws_query_params.setdefault("api-version", config.api_version)
+    ws_query = urlencode(ws_query_params)
+    computed_ws_url = f"{ws_scheme}{ws_base}{ws_path}?{ws_query}"
+
+    def ensure_ws_query(url_value: str) -> str:
+        try:
+            parsed = urlparse(url_value)
+        except ValueError:
+            return url_value
+        query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        updated = False
+        if "model" not in query_params:
+            query_params["model"] = config.deployment
+            updated = True
+        if "deployment" not in query_params:
+            query_params["deployment"] = config.deployment
+            updated = True
+        if is_azure_resource and config.api_key and "api-key" not in query_params:
+            query_params["api-key"] = config.api_key
+            updated = True
+        if session_id and "session" not in query_params:
+            query_params["session"] = session_id
+            updated = True
+        if config.api_version and "api-version" not in query_params:
+            query_params["api-version"] = config.api_version
+            updated = True
+        if not updated:
+            return url_value
+        new_query = urlencode(query_params)
+        return urlunparse(parsed._replace(query=new_query))
+
+    normalized_websocket_url = None
+    if isinstance(websocket_url, str) and websocket_url:
+        normalized_websocket_url = ensure_ws_query(websocket_url)
+
     return RealtimeSessionResponse(
         clientSecret=client_secret,
         sessionId=session_id,
         expiresAt=expires_value,
         iceServers=ice_servers,
-        sdpUrl=config.realtime_host.rstrip("/") + "/v1/realtimertc",
+        sdpUrl=(webrtc_info.get("sdp_url") if isinstance(webrtc_info, dict) else None)
+        or (config.realtime_host.rstrip("/") + "/v1/realtimertc" if config.realtime_host else None),
+        wsUrl=normalized_websocket_url or computed_ws_url,
+        wsProtocols=websocket_protocols,
+        sessionExpiresAt=str(session_expires_at) if session_expires_at is not None else None,
     )

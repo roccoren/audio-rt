@@ -157,9 +157,7 @@ class AzureVoiceClient:
 
                 await connection.response.create(
                     response={
-                        "modalities": ["audio", "text"],
-                        "output_audio_format": "pcm16",
-                        "voice": voice_name,
+                        "output_modalities": ["audio"],
                     }
                 )
 
@@ -168,21 +166,21 @@ class AzureVoiceClient:
 
                 async for event in connection:
                     event_type = getattr(event, "type", None)
-                    if event_type in {"response.text.delta", "response.output_text.delta"}:
-                        delta = getattr(event, "delta", "") or ""
-                        if delta:
-                            collected_text.append(delta)
-                    elif event_type in {"response.audio.delta", "response.output_audio.delta"}:
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            collected_audio.extend(base64.b64decode(delta))
-                    elif event_type in {
-                        "response.audio_transcript.delta",
+                    if event_type in {
+                        "response.text.delta",
+                        "response.output_text.delta",
                         "response.output_audio_transcript.delta",
                     }:
                         delta = getattr(event, "delta", "") or ""
                         if delta:
                             collected_text.append(delta)
+                    elif event_type in {
+                        "response.audio.delta",
+                        "response.output_audio.delta",
+                    }:
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            collected_audio.extend(base64.b64decode(delta))
                     elif event_type in {
                         "response.text.done",
                         "response.output_text.done",
@@ -209,19 +207,17 @@ class AzureVoiceClient:
                     raise AzureVoiceClientError(message)
                 transcript = "".join(collected_text).strip()
                 if transcript:
-                    self._logger.debug("Collected transcript (dropping from response): %s", transcript)
-                return "", audio_bytes
+                    self._logger.debug("Collected transcript from realtime response: %s", transcript)
+                return transcript, audio_bytes
         finally:
             await client.close()
 
     async def _configure_session(self, connection, *, instructions: str, voice: str) -> None:
         await connection.session.update(
             session={
+                "type": "realtime",
                 "instructions": instructions,
-                "voice": voice,
-                "modalities": ["audio", "text"],
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
+                "output_modalities": ["audio"],
             }
         )
 
