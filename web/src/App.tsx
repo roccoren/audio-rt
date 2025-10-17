@@ -47,6 +47,12 @@ type RealtimeSessionInfo = {
   wsProtocols?: string[] | null;
 };
 
+type RealtimeResponseState = {
+  audioChunks: Uint8Array[];
+  textParts: string[];
+  timestamp: string;
+};
+
 const ZARA_INSTRUCTIONS =
   "You are Zara, a human like AI character developed in twenty twenty five. " +
   "You are a good listener and a concise communicator. You believe in nuance as a guiding principle. " +
@@ -194,6 +200,174 @@ function calculateRms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length);
 }
 
+function collectTextCandidates(value: unknown, parts: string[]): void {
+  if (value === null || value === undefined) {
+    return;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) {
+      parts.push(trimmed);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectTextCandidates(item, parts));
+    return;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    for (const [key, nested] of entries) {
+      if (nested === null || nested === undefined) {
+        continue;
+      }
+      const lowered = key.toLowerCase();
+      if (
+        lowered.includes("text") ||
+        lowered.includes("caption") ||
+        lowered.includes("transcript") ||
+        lowered.includes("message") ||
+        lowered.includes("value") ||
+        lowered.includes("content") ||
+        lowered.endsWith("delta") ||
+        lowered === "output"
+      ) {
+        collectTextCandidates(nested, parts);
+      }
+    }
+  }
+}
+
+function appendTextDelta(delta: unknown, parts: string[]): void {
+  collectTextCandidates(delta, parts);
+}
+
+function extractTextFromResponsePayload(payload: unknown): string[] {
+  const segments: string[] = [];
+  if (!payload || typeof payload !== "object") {
+    return segments;
+  }
+  const container = payload as { output?: unknown; outputs?: unknown; content?: unknown; text?: unknown };
+
+  const outputs = Array.isArray(container.output)
+    ? container.output
+    : Array.isArray(container.outputs)
+      ? container.outputs
+      : null;
+
+  if (outputs) {
+    outputs.forEach((output) => {
+      if (!output || typeof output !== "object") {
+        if (typeof output === "string") {
+          segments.push(output);
+        }
+        return;
+      }
+      const contentItems = (output as { content?: unknown }).content;
+      if (Array.isArray(contentItems)) {
+        contentItems.forEach((item) => {
+          if (item && typeof item === "object") {
+            const itemType = (item as { type?: unknown }).type;
+            const textValue = (item as { text?: unknown }).text;
+            if ((itemType === "output_text" || itemType === "text") && typeof textValue === "string") {
+              segments.push(textValue);
+            } else if (typeof textValue === "string" && !itemType) {
+              segments.push(textValue);
+            }
+          } else if (typeof item === "string") {
+            segments.push(item);
+          }
+        });
+      }
+    });
+  }
+
+  const content = Array.isArray(container.content) ? container.content : null;
+  if (content) {
+    content.forEach((item) => appendTextDelta(item, segments));
+  }
+
+  const textValue = container.text;
+  if (typeof textValue === "string" && textValue.trim()) {
+    segments.push(textValue);
+  }
+
+  const outputText = (container as { output_text?: unknown; outputText?: unknown }).output_text;
+  if (outputText !== undefined) {
+    appendTextDelta(outputText, segments);
+  }
+  const camelOutputText = (container as { outputText?: unknown }).outputText;
+  if (camelOutputText !== undefined) {
+    appendTextDelta(camelOutputText, segments);
+  }
+
+  const messages = (container as { messages?: unknown }).messages;
+  if (messages !== undefined) {
+    appendTextDelta(messages, segments);
+  }
+
+  return segments;
+}
+
+function pcm16ChunksToWavBlob(chunks: Uint8Array[], sampleRate: number): Blob | null {
+  if (!chunks.length) {
+    return null;
+  }
+  let totalBytes = 0;
+  chunks.forEach((chunk) => {
+    totalBytes += chunk.byteLength;
+  });
+  if (!totalBytes) {
+    return null;
+  }
+
+  const headerSize = 44;
+  const buffer = new ArrayBuffer(headerSize + totalBytes);
+  const view = new DataView(buffer);
+
+  let offset = 0;
+  const writeString = (value: string) => {
+    for (let i = 0; i < value.length; i++) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+    offset += value.length;
+  };
+
+  writeString("RIFF");
+  view.setUint32(offset, 36 + totalBytes, true);
+  offset += 4;
+  writeString("WAVE");
+  writeString("fmt ");
+  view.setUint32(offset, 16, true);
+  offset += 4;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint32(offset, sampleRate, true);
+  offset += 4;
+  const byteRate = sampleRate * 2;
+  view.setUint32(offset, byteRate, true);
+  offset += 4;
+  const blockAlign = 2;
+  view.setUint16(offset, blockAlign, true);
+  offset += 2;
+  view.setUint16(offset, 16, true);
+  offset += 2;
+  writeString("data");
+  view.setUint32(offset, totalBytes, true);
+  offset += 4;
+
+  const pcmData = new Uint8Array(buffer, headerSize, totalBytes);
+  let dataOffset = 0;
+  chunks.forEach((chunk) => {
+    pcmData.set(chunk, dataOffset);
+    dataOffset += chunk.byteLength;
+  });
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 export default function App(): JSX.Element {
   const [mode, setMode] = useState<ConversationMode>("voice");
   const [callTransport, setCallTransport] = useState<CallTransport>("webrtc");
@@ -205,6 +379,9 @@ export default function App(): JSX.Element {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [callStatus, setCallStatus] = useState<"idle" | "connecting" | "connected">("idle");
+  const [callTranscripts, setCallTranscripts] = useState<
+    Record<string, { text: string; isFinal: boolean; timestamp: string }>
+  >({});
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -223,6 +400,7 @@ export default function App(): JSX.Element {
   const callLastVoiceActivityRef = useRef<number>(performance.now());
   const callAwaitingResponseRef = useRef(false);
   const callHasSpeechSinceCommitRef = useRef(false);
+  const callResponseStateRef = useRef<Map<string, RealtimeResponseState>>(new Map());
 
   const awaitIceGatheringComplete = useCallback(
     (peer: RTCPeerConnection) =>
@@ -331,7 +509,47 @@ export default function App(): JSX.Element {
     callHasSpeechSinceCommitRef.current = false;
     callStreamingStateRef.current = "idle";
     callPlaybackTimeRef.current = 0;
+    callResponseStateRef.current.clear();
+    setCallTranscripts({});
   }, []);
+
+  const ensureRealtimeResponseState = useCallback((responseId: string): RealtimeResponseState => {
+    const store = callResponseStateRef.current;
+    let state = store.get(responseId);
+    if (!state) {
+      state = {
+        audioChunks: [],
+        textParts: [],
+        timestamp: new Date().toISOString(),
+      };
+      store.set(responseId, state);
+    }
+    return state;
+  }, []);
+
+  const getRealtimeResponseState = useCallback(
+    (responseId: string | null | undefined): [string, RealtimeResponseState] => {
+      const store = callResponseStateRef.current;
+      const trimmed = (responseId || "").trim();
+      if (trimmed) {
+        let state = store.get(trimmed);
+        if (!state) {
+          const fallback = store.get("__default__");
+          if (fallback) {
+            store.delete("__default__");
+            state = fallback;
+            store.set(trimmed, state);
+          } else {
+            state = ensureRealtimeResponseState(trimmed);
+          }
+        }
+        return [trimmed, state];
+      }
+      const key = "__default__";
+      return [key, ensureRealtimeResponseState(key)];
+    },
+    [ensureRealtimeResponseState],
+  );
 
   const stopWebrtcCall = useCallback(() => {
     const peer = callPeerRef.current;
@@ -552,14 +770,14 @@ export default function App(): JSX.Element {
           session: {
             type: "realtime",
             instructions: ZARA_INSTRUCTIONS,
-            output_modalities: ["audio"],
+            output_modalities: ["audio", "text"],
           },
         };
         eventsChannel.send(JSON.stringify(sessionUpdate));
         const responseCreate = {
           type: "response.create",
           response: {
-            output_modalities: ["audio"],
+            output_modalities: ["audio", "text"],
           },
         };
         eventsChannel.send(JSON.stringify(responseCreate));
@@ -568,6 +786,7 @@ export default function App(): JSX.Element {
         try {
           const payload = JSON.parse(event.data as string);
           console.debug("oai-events message", payload);
+          handleRealtimeWsEvent(payload);
         } catch {
           console.debug("oai-events raw", event.data);
         }
@@ -691,23 +910,42 @@ export default function App(): JSX.Element {
       if (payload === null || typeof payload !== "object") {
         return;
       }
-      const event = payload as { type?: string; delta?: string; error?: { message?: string }; message?: string };
-      const eventType = event.type;
-      if (!eventType) {
+      const event = payload as Record<string, unknown>;
+      const rawType = event.type;
+      if (typeof rawType !== "string" || !rawType) {
         return;
       }
+      const eventType = rawType;
+
+      const responseCandidate = event.response;
+      const candidateIds: unknown[] = [event.response_id, event.responseId, event.responseID, event.id];
+      if (responseCandidate && typeof responseCandidate === "object") {
+        candidateIds.push((responseCandidate as { id?: unknown }).id);
+        candidateIds.push((responseCandidate as { response_id?: unknown }).response_id);
+        candidateIds.push((responseCandidate as { responseId?: unknown }).responseId);
+      }
+      let responseId: string | null = null;
+      for (const candidate of candidateIds) {
+        if (typeof candidate === "string" && candidate.trim()) {
+          responseId = candidate;
+          break;
+        }
+      }
+      const [responseKey, responseState] = getRealtimeResponseState(responseId);
+
       if (eventType === "response.audio.delta" || eventType === "response.output_audio.delta") {
         const delta = event.delta;
-        if (!delta) {
-          return;
-        }
-        const audioContext = callAudioContextRef.current;
-        const destination = callDestinationRef.current;
-        if (!audioContext || !destination) {
+        if (typeof delta !== "string" || !delta) {
           return;
         }
         const pcmBytes = base64ToUint8Array(delta);
         if (!pcmBytes.length) {
+          return;
+        }
+        responseState.audioChunks.push(new Uint8Array(pcmBytes));
+        const audioContext = callAudioContextRef.current;
+        const destination = callDestinationRef.current;
+        if (!audioContext || !destination) {
           return;
         }
         const float32 = pcm16BytesToFloat32(pcmBytes);
@@ -722,19 +960,111 @@ export default function App(): JSX.Element {
         const startAt = Math.max(callPlaybackTimeRef.current, audioContext.currentTime);
         source.start(startAt);
         callPlaybackTimeRef.current = startAt + buffer.duration;
+      } else if (eventType.startsWith("response.") && eventType.endsWith(".delta") && !eventType.includes("audio")) {
+        appendTextDelta(event.delta, responseState.textParts);
+        const currentText = responseState.textParts.join("");
+        console.debug("Text delta received", { eventType, delta: event.delta, currentText, responseKey });
+        if (currentText.trim()) {
+          setCallTranscripts((prev) => ({
+            ...prev,
+            [responseKey]: {
+              text: currentText,
+              isFinal: false,
+              timestamp: responseState.timestamp,
+            },
+          }));
+        }
+      } else if (eventType === "response.text.delta" || eventType === "response.output_text.delta" || eventType === "response.audio_transcript.delta") {
+        const delta = event.delta;
+        if (typeof delta === "string" && delta) {
+          responseState.textParts.push(delta);
+          const currentText = responseState.textParts.join("");
+          console.debug("Explicit text delta", { eventType, delta, currentText, responseKey });
+          setCallTranscripts((prev) => ({
+            ...prev,
+            [responseKey]: {
+              text: currentText,
+              isFinal: false,
+              timestamp: responseState.timestamp,
+            },
+          }));
+        }
+      } else if (eventType === "response.created") {
+        ensureRealtimeResponseState(responseKey);
       } else if (eventType === "response.completed" || eventType === "response.done") {
         callAwaitingResponseRef.current = false;
         callStreamingStateRef.current = "idle";
         callHasSpeechSinceCommitRef.current = false;
+
+        if (!responseState.textParts.length) {
+          const responsePayload = responseCandidate ?? event;
+          const segments = extractTextFromResponsePayload(responsePayload);
+          if (segments.length) {
+            responseState.textParts.push(...segments);
+          }
+        }
+        let transcript = responseState.textParts.join("").trim();
+        if (!transcript) {
+          const messageText = typeof event.message === "string" ? event.message.trim() : "";
+          if (messageText) {
+            transcript = messageText;
+          }
+        }
+
+        let audioUrl: string | undefined;
+        if (responseState.audioChunks.length) {
+          const wavBlob = pcm16ChunksToWavBlob(responseState.audioChunks, TARGET_SAMPLE_RATE);
+          if (wavBlob) {
+            audioUrl = URL.createObjectURL(wavBlob);
+          }
+        }
+
+        console.debug("Response completed", { transcript, audioUrl, textParts: responseState.textParts, responseKey });
+        if (transcript || audioUrl) {
+          const message: Message = {
+            id: uuid(),
+            role: "zara",
+            text: transcript || "Zara sent an audio reply.",
+            audioUrl,
+            timestamp: responseState.timestamp,
+          };
+          setHistory((prev) => [...prev, message]);
+          if (transcript) {
+            setCallTranscripts((prev) => ({
+              ...prev,
+              [responseKey]: {
+                text: transcript,
+                isFinal: true,
+                timestamp: responseState.timestamp,
+              },
+            }));
+          }
+        }
+
+        callResponseStateRef.current.delete(responseKey);
       } else if (eventType === "response.error" || eventType === "error") {
-        const message = event.error?.message ?? event.message ?? "Realtime response error.";
-        console.error("Realtime response error", message, payload);
+        const errorInfo = event.error;
+        let message: string | null = null;
+        if (errorInfo && typeof errorInfo === "object") {
+          const errorMessage = (errorInfo as { message?: unknown }).message;
+          if (typeof errorMessage === "string") {
+            message = errorMessage;
+          }
+        }
+        if (!message && typeof event.message === "string") {
+          message = event.message;
+        }
+        const finalMessage = message ?? "Realtime response error.";
+        console.error("Realtime response error", finalMessage, payload);
         setError("实时通话连接失败，请稍后再试。");
+        if (callResponseStateRef.current.has(responseKey)) {
+          callResponseStateRef.current.delete(responseKey);
+        }
       } else if (!eventType.startsWith("input_audio_buffer.") && !eventType.startsWith("session.")) {
         console.debug("Unhandled realtime event", payload);
       }
     },
-    [setError],
+    [ensureRealtimeResponseState, getRealtimeResponseState, setError, setHistory],
   );
 
   const startWebsocketCall = useCallback(async () => {
@@ -875,14 +1205,14 @@ export default function App(): JSX.Element {
             session: {
               type: "realtime",
               instructions: ZARA_INSTRUCTIONS,
-              output_modalities: ["audio"],
+              output_modalities: ["audio", "text"],
             },
           };
           ws.send(JSON.stringify(sessionUpdate));
           const responseCreate = {
             type: "response.create",
             response: {
-              output_modalities: ["audio"],
+              output_modalities: ["audio", "text"],
             },
           };
           ws.send(JSON.stringify(responseCreate));
@@ -1291,6 +1621,30 @@ export default function App(): JSX.Element {
               <div className="audio-player" style={{ marginTop: "0.75rem" }}>
                 <audio ref={remoteAudioRef} autoPlay playsInline />
               </div>
+              {callStatus === "connected" && Object.keys(callTranscripts).length > 0 && (
+                <div style={{ marginTop: "1rem", padding: "1rem", borderRadius: "12px", backgroundColor: "rgba(15, 23, 42, 0.6)", border: "1px solid rgba(148, 163, 184, 0.2)" }}>
+                  <h3 style={{ margin: "0 0 0.75rem", fontSize: "0.95rem", color: "rgba(226, 232, 240, 0.9)" }}>实时转录</h3>
+                  {Object.entries(callTranscripts).map(([key, data]) => (
+                    <div
+                      key={key}
+                      style={{
+                        marginBottom: "0.5rem",
+                        padding: "0.5rem 0.75rem",
+                        borderRadius: "8px",
+                        backgroundColor: data.isFinal ? "rgba(56, 189, 248, 0.1)" : "rgba(148, 163, 184, 0.1)",
+                        borderLeft: `3px solid ${data.isFinal ? "rgba(56, 189, 248, 0.5)" : "rgba(148, 163, 184, 0.3)"}`,
+                      }}
+                    >
+                      <div style={{ fontSize: "0.85rem", color: data.isFinal ? "rgba(226, 232, 240, 0.95)" : "rgba(226, 232, 240, 0.7)", fontStyle: data.isFinal ? "normal" : "italic" }}>
+                        {data.text || "..."}
+                      </div>
+                      <div style={{ fontSize: "0.75rem", color: "rgba(148, 163, 184, 0.6)", marginTop: "0.25rem" }}>
+                        {new Date(data.timestamp).toLocaleTimeString()} {data.isFinal ? "✓" : "⋯"}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </>
           )}
 
