@@ -191,7 +191,7 @@ async def _create_voicelive_session(payload: RealtimeSessionRequest) -> Realtime
 
     session_body: dict[str, object] = {
         "model": config.model,
-        "modalities": ["audio", "text"],
+        "modalities": ["audio"],
         "input_audio_format": "pcm16",
         "output_audio_format": "pcm16",
         "turn_detection": {

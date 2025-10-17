@@ -768,19 +768,10 @@ export default function App(): JSX.Element {
         const sessionUpdate = {
           type: "session.update",
           session: {
-            type: "realtime",
             instructions: ZARA_INSTRUCTIONS,
-            output_modalities: ["audio", "text"],
           },
         };
         eventsChannel.send(JSON.stringify(sessionUpdate));
-        const responseCreate = {
-          type: "response.create",
-          response: {
-            output_modalities: ["audio", "text"],
-          },
-        };
-        eventsChannel.send(JSON.stringify(responseCreate));
       });
       eventsChannel.addEventListener("message", (event) => {
         try {
@@ -953,7 +944,7 @@ export default function App(): JSX.Element {
           return;
         }
         const buffer = audioContext.createBuffer(1, float32.length, TARGET_SAMPLE_RATE);
-        buffer.copyToChannel(float32, 0);
+        buffer.copyToChannel(Float32Array.from(float32), 0);
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(destination);
@@ -1205,17 +1196,9 @@ export default function App(): JSX.Element {
             session: {
               type: "realtime",
               instructions: ZARA_INSTRUCTIONS,
-              output_modalities: ["audio", "text"],
             },
           };
           ws.send(JSON.stringify(sessionUpdate));
-          const responseCreate = {
-            type: "response.create",
-            response: {
-              output_modalities: ["audio", "text"],
-            },
-          };
-          ws.send(JSON.stringify(responseCreate));
         }
         setCallStatus("connected");
         console.debug("Realtime websocket connected.");
@@ -1608,7 +1591,7 @@ export default function App(): JSX.Element {
                   type="button"
                   className="send-btn primary"
                   onClick={callActive ? stopCall : startCall}
-                  disabled={!callActive && callStatus === "connecting"}
+                  disabled={callStatus === "connecting"}
                 >
                   {callActive ? "结束实时通话" : "开始实时通话"}
                 </button>
