@@ -5,6 +5,7 @@ const TARGET_SAMPLE_RATE = 24000;
 
 type ConversationMode = "text" | "voice" | "call";
 type CallTransport = "webrtc" | "websocket";
+type CallProvider = "gpt-realtime" | "voicelive";
 
 const MODE_OPTIONS: Array<{ value: ConversationMode; label: string; description: string }> = [
   { value: "text", label: "文字 → 语音", description: "键入内容，Zara 用语音回复。" },
@@ -196,6 +197,7 @@ function calculateRms(samples: Float32Array): number {
 export default function App(): JSX.Element {
   const [mode, setMode] = useState<ConversationMode>("voice");
   const [callTransport, setCallTransport] = useState<CallTransport>("webrtc");
+  const [callProvider, setCallProvider] = useState<CallProvider>("gpt-realtime");
   const [text, setText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [capturedAudio, setCapturedAudio] = useState<CapturedAudio | null>(null);
@@ -267,6 +269,9 @@ export default function App(): JSX.Element {
       if (callStatus === "connected") {
         return "实时通话进行中，说话即可被 Zara 听到。";
       }
+      if (callProvider === "voicelive") {
+        return "选择 VoiceLive 后将通过 WebSocket 直接连接 Azure VoiceLive。";
+      }
       return "点击“开始实时通话”即可像电话一样聊天。";
     }
     if (loading) {
@@ -285,7 +290,7 @@ export default function App(): JSX.Element {
       return "Type something for Zara to riff on.";
     }
     return "Ready to send.";
-  }, [callStatus, capturedAudio, error, isRecording, loading, mode, text]);
+  }, [callProvider, callStatus, capturedAudio, error, isRecording, loading, mode, text]);
 
   useEffect(() => {
     return () => {
@@ -490,6 +495,10 @@ export default function App(): JSX.Element {
     if (callStatus !== "idle") {
       return;
     }
+    if (callProvider === "voicelive") {
+      setError("VoiceLive 当前仅支持 WebSocket 连接。");
+      return;
+    }
     setError(null);
     setCallStatus("connecting");
     try {
@@ -500,6 +509,7 @@ export default function App(): JSX.Element {
         },
         body: JSON.stringify({
           instructions: ZARA_INSTRUCTIONS,
+          provider: callProvider,
         }),
       });
       if (!sessionResponse.ok) {
@@ -619,6 +629,7 @@ export default function App(): JSX.Element {
         body: JSON.stringify({
           offerSdp: localDescription.sdp,
           clientSecret: sessionInfo.clientSecret,
+          provider: callProvider,
         }),
       });
       if (!handshakeResponse.ok) {
@@ -673,7 +684,7 @@ export default function App(): JSX.Element {
       setCallStatus("idle");
       resetRealtimeState();
     }
-  }, [awaitIceGatheringComplete, callStatus, resetRealtimeState, stopWebrtcCall]);
+  }, [awaitIceGatheringComplete, callProvider, callStatus, resetRealtimeState, stopWebrtcCall]);
 
   const handleRealtimeWsEvent = useCallback(
     (payload: unknown) => {
@@ -733,29 +744,6 @@ export default function App(): JSX.Element {
     setError(null);
     setCallStatus("connecting");
     try {
-      const sessionResponse = await fetch(`${API_BASE_URL}/api/realtime/session`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          instructions: ZARA_INSTRUCTIONS,
-        }),
-      });
-      if (!sessionResponse.ok) {
-        const message = await sessionResponse.text();
-        throw new Error(message || "Failed to create realtime session.");
-      }
-      const sessionInfo = (await sessionResponse.json()) as RealtimeSessionInfo;
-      console.debug("Realtime session info", sessionInfo);
-      sessionInfoRef.current = sessionInfo;
-      if (!sessionInfo.clientSecret) {
-        throw new Error("Realtime session missing client secret.");
-      }
-      if (!sessionInfo.wsUrl) {
-        throw new Error("Realtime session missing websocket URL.");
-      }
-
       const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       callLocalStreamRef.current = localStream;
 
@@ -803,37 +791,75 @@ export default function App(): JSX.Element {
         }
       }
 
-      const clientSecret = sessionInfo.clientSecret;
-      const baseProtocols: string[] = [];
-      const ensureSecret = (base: string) => `${base}.${clientSecret}`;
-
-      baseProtocols.push("realtime");
-      baseProtocols.push(ensureSecret("openai-ephemeral-key-v1"));
-      baseProtocols.push(ensureSecret("openai-insecure-session-token-v1"));
-
-      const dynamicProtocols: string[] = [];
-      if (sessionInfo.wsProtocols && sessionInfo.wsProtocols.length > 0) {
-        sessionInfo.wsProtocols.forEach((rawProtocol) => {
-          if (typeof rawProtocol !== "string") {
-            return;
-          }
-          let normalized = rawProtocol.replace("{SESSION_SECRET}", clientSecret);
-          if (normalized === "openai-ephemeral-key-v1") {
-            normalized = ensureSecret("openai-ephemeral-key-v1");
-          } else if (normalized === "realtime") {
-            normalized = "realtime";
-          }
-          const trimmed = normalized.trim();
-          if (trimmed) {
-            dynamicProtocols.push(trimmed);
-          }
+      let ws: WebSocket;
+      if (callProvider === "voicelive") {
+        sessionInfoRef.current = null;
+        const apiUrl = new URL(API_BASE_URL);
+        const wsProtocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${wsProtocol}//${apiUrl.host}/api/voicelive/ws`;
+        console.debug("VoiceLive bridge websocket url", wsUrl);
+        ws = new WebSocket(wsUrl);
+      } else {
+        const sessionResponse = await fetch(`${API_BASE_URL}/api/realtime/session`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            instructions: ZARA_INSTRUCTIONS,
+            provider: callProvider,
+          }),
         });
+        if (!sessionResponse.ok) {
+          const message = await sessionResponse.text();
+          throw new Error(message || "Failed to create realtime session.");
+        }
+        const sessionInfo = (await sessionResponse.json()) as RealtimeSessionInfo;
+        console.debug("Realtime session info", sessionInfo);
+        sessionInfoRef.current = sessionInfo;
+        if (!sessionInfo.clientSecret) {
+          throw new Error("Realtime session missing client secret.");
+        }
+        if (!sessionInfo.wsUrl) {
+          throw new Error("Realtime session missing websocket URL.");
+        }
+
+        const clientSecret = sessionInfo.clientSecret;
+        const ensureSecret = (base: string) => `${base}.${clientSecret}`;
+
+        const baseProtocols: string[] = [
+          "realtime",
+          ensureSecret("openai-ephemeral-key-v1"),
+          ensureSecret("openai-insecure-session-token-v1"),
+        ];
+
+        const dynamicProtocols: string[] = [];
+        if (sessionInfo.wsProtocols && sessionInfo.wsProtocols.length > 0) {
+          sessionInfo.wsProtocols.forEach((rawProtocol) => {
+            if (typeof rawProtocol !== "string") {
+              return;
+            }
+            let normalized = rawProtocol.replace("{SESSION_SECRET}", clientSecret);
+            if (normalized === "openai-ephemeral-key-v1") {
+              normalized = ensureSecret("openai-ephemeral-key-v1");
+            } else if (normalized === "openai-insecure-session-token-v1") {
+              normalized = ensureSecret("openai-insecure-session-token-v1");
+            } else if (normalized === "realtime") {
+              normalized = "realtime";
+            }
+            const trimmed = normalized.trim();
+            if (trimmed) {
+              dynamicProtocols.push(trimmed);
+            }
+          });
+        }
+
+        const wsProtocols = [...baseProtocols, ...dynamicProtocols.filter((value) => !baseProtocols.includes(value))];
+        console.debug("Realtime websocket url", sessionInfo.wsUrl);
+        console.debug("Realtime websocket protocols", wsProtocols);
+        ws = new WebSocket(sessionInfo.wsUrl, wsProtocols);
       }
 
-      const wsProtocols = [...baseProtocols, ...dynamicProtocols.filter((value) => !baseProtocols.includes(value))];
-      console.debug("Realtime websocket url", sessionInfo.wsUrl);
-      console.debug("Realtime websocket protocols", wsProtocols);
-      const ws = new WebSocket(sessionInfo.wsUrl, wsProtocols);
       callSocketRef.current = ws;
 
       const teardown = () => {
@@ -843,15 +869,24 @@ export default function App(): JSX.Element {
       };
 
       ws.addEventListener("open", () => {
-        const sessionUpdate = {
-          type: "session.update",
-          session: {
-            type: "realtime",
-            instructions: ZARA_INSTRUCTIONS,
-            output_modalities: ["audio"],
-          },
-        };
-        ws.send(JSON.stringify(sessionUpdate));
+        if (callProvider !== "voicelive") {
+          const sessionUpdate = {
+            type: "session.update",
+            session: {
+              type: "realtime",
+              instructions: ZARA_INSTRUCTIONS,
+              output_modalities: ["audio"],
+            },
+          };
+          ws.send(JSON.stringify(sessionUpdate));
+          const responseCreate = {
+            type: "response.create",
+            response: {
+              output_modalities: ["audio"],
+            },
+          };
+          ws.send(JSON.stringify(responseCreate));
+        }
         setCallStatus("connected");
         console.debug("Realtime websocket connected.");
       });
@@ -958,7 +993,7 @@ export default function App(): JSX.Element {
       setCallStatus("idle");
       resetRealtimeState();
     }
-  }, [callStatus, handleRealtimeWsEvent, resetRealtimeState, stopWebsocketCall]);
+  }, [callProvider, callStatus, handleRealtimeWsEvent, resetRealtimeState, stopWebsocketCall]);
 
   const startCall = useCallback(async () => {
     if (callTransport === "webrtc") {
@@ -969,6 +1004,12 @@ export default function App(): JSX.Element {
   }, [callTransport, startWebrtcCall, startWebsocketCall]);
 
   const callActive = callStatus === "connected" || callStatus === "connecting";
+
+  useEffect(() => {
+    if (callProvider === "voicelive" && callTransport === "webrtc") {
+      setCallTransport("websocket");
+    }
+  }, [callProvider, callTransport]);
 
   useEffect(() => {
     return () => {
@@ -1072,6 +1113,10 @@ export default function App(): JSX.Element {
     setCallTransport(event.target.value as CallTransport);
   }, []);
 
+  const handleProviderChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setCallProvider(event.target.value as CallProvider);
+  }, []);
+
   const hasPendingActions =
     loading || (mode === "voice" && isRecording) || (mode === "call" && callStatus === "connecting");
 
@@ -1173,6 +1218,36 @@ export default function App(): JSX.Element {
                 style={{ display: "flex", gap: "1rem", alignItems: "center", marginBottom: "0.75rem" }}
               >
                 <span className="transport-label" style={{ fontWeight: 600 }}>
+                  通话后端
+                </span>
+                <label className="transport-option" style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+                  <input
+                    type="radio"
+                    name="call-provider"
+                    value="gpt-realtime"
+                    checked={callProvider === "gpt-realtime"}
+                    onChange={handleProviderChange}
+                    disabled={callActive}
+                  />
+                  <span>GPT Realtime</span>
+                </label>
+                <label className="transport-option" style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+                  <input
+                    type="radio"
+                    name="call-provider"
+                    value="voicelive"
+                    checked={callProvider === "voicelive"}
+                    onChange={handleProviderChange}
+                    disabled={callActive}
+                  />
+                  <span>VoiceLive</span>
+                </label>
+              </div>
+              <div
+                className="transport-options"
+                style={{ display: "flex", gap: "1rem", alignItems: "center", marginBottom: "0.75rem" }}
+              >
+                <span className="transport-label" style={{ fontWeight: 600 }}>
                   连接方式
                 </span>
                 <label className="transport-option" style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
@@ -1182,7 +1257,7 @@ export default function App(): JSX.Element {
                     value="webrtc"
                     checked={callTransport === "webrtc"}
                     onChange={handleTransportChange}
-                    disabled={callActive}
+                    disabled={callActive || callProvider === "voicelive"}
                   />
                   <span>WebRTC</span>
                 </label>
@@ -1208,7 +1283,11 @@ export default function App(): JSX.Element {
                   {callActive ? "结束实时通话" : "开始实时通话"}
                 </button>
               </div>
-              <p className="helper-text">启动后 Zara 会实时倾听与回应，建议佩戴耳机防止回声。</p>
+              <p className="helper-text">
+                {callProvider === "voicelive"
+                  ? "VoiceLive 使用 WebSocket 直连，请确保浏览器已授权麦克风。"
+                  : "启动后 Zara 会实时倾听与回应，建议佩戴耳机防止回声。"}
+              </p>
               <div className="audio-player" style={{ marginTop: "0.75rem" }}>
                 <audio ref={remoteAudioRef} autoPlay playsInline />
               </div>

@@ -18,6 +18,7 @@ from openai import AsyncAzureOpenAI
 
 
 DEFAULT_REALTIME_API_VERSION = "2025-08-28"
+DEFAULT_VOICELIVE_API_VERSION = "2025-10-01"
 
 _DOTENV_CACHE: Optional[Dict[str, str]] = None
 
@@ -260,6 +261,16 @@ class AzureVoiceClientConfig:
     sample_rate_hz: int = 24000
     realtime_host: Optional[str] = None
     personal_voice: Optional[PersonalVoiceConfig] = None
+
+
+@dataclass
+class AzureVoiceLiveConfig:
+    endpoint: str
+    model: str
+    api_version: str = DEFAULT_VOICELIVE_API_VERSION
+    voice: Optional[str] = None
+    api_key: Optional[str] = None
+    instructions: Optional[str] = None
 
 
 class AzureVoiceClient:
@@ -515,6 +526,45 @@ def _normalize_endpoint(endpoint: str) -> str:
     elif not endpoint.startswith("https://"):
         endpoint = f"https://{endpoint}"
     return endpoint.rstrip("/")
+
+
+def load_voicelive_env_config(
+    *,
+    voice_override: Optional[str] = None,
+    api_version_override: Optional[str] = None,
+) -> AzureVoiceLiveConfig:
+    endpoint = _get_env("AZURE_VOICELIVE_ENDPOINT")
+    model = _get_env("AZURE_VOICELIVE_MODEL")
+    if not endpoint or not model:
+        missing = [
+            name
+            for name, value in [
+                ("AZURE_VOICELIVE_ENDPOINT", endpoint),
+                ("AZURE_VOICELIVE_MODEL", model),
+            ]
+            if not value
+        ]
+        raise RuntimeError(f"Missing required VoiceLive environment variable(s): {', '.join(missing)}")
+
+    if endpoint.startswith("wss://"):
+        endpoint = "https://" + endpoint[len("wss://") :]
+    elif endpoint.startswith("ws://"):
+        endpoint = "http://" + endpoint[len("ws://") :]
+    endpoint = _normalize_endpoint(endpoint)
+
+    api_version = api_version_override or _get_env("AZURE_VOICELIVE_API_VERSION") or DEFAULT_VOICELIVE_API_VERSION
+    api_key = _get_env("AZURE_VOICELIVE_API_KEY")
+    voice = voice_override or _get_env("AZURE_VOICELIVE_VOICE") or "en-US-Ava:DragonHDLatestNeural"
+    instructions = _get_env("AZURE_VOICELIVE_INSTRUCTIONS")
+
+    return AzureVoiceLiveConfig(
+        endpoint=endpoint,
+        model=model,
+        api_version=api_version,
+        voice=voice,
+        api_key=api_key,
+        instructions=instructions,
+    )
 
 
 def load_env_config(

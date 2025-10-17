@@ -8,3 +8,4 @@ websockets>=12.0
 openai>=1.51.0
 httpx>=0.27.0
 azure-cognitiveservices-speech>=1.37.0
+azure-ai-voicelive>=1.0.0b1

@@ -18,6 +18,11 @@ This workspace contains a Python service and a modern React web app that talk to
     - `AZURE_OPENAI_VOICE`
     - `AZURE_OPENAI_SAMPLE_RATE`
     - `AZURE_OPENAI_API_VERSION`
+  - Optional Azure VoiceLive (preview):
+    - `AZURE_VOICELIVE_ENDPOINT`
+    - `AZURE_VOICELIVE_MODEL`
+    - `AZURE_VOICELIVE_API_VERSION` (defaults to `2025-10-01`)
+    - `AZURE_VOICELIVE_API_KEY` (required when not using AAD credentials)
   - Optional personal voice support:
     - `AZURE_SPEECH_KEY`
     - `AZURE_SPEECH_REGION`
@@ -67,6 +72,10 @@ PYTHONPATH=. uvicorn app.main:app --reload
 
 The service expects base64-encoded 16-bit PCM audio and returns a WAV-encoded reply along with the transcript. For realtime calls it creates an ephemeral session (`/api/realtime/session`) and relays the SDP offer/answer exchange (`/api/realtime/handshake`). CORS is open for local development.
 
+`/api/realtime/session` accepts a `provider` field so you can choose between the default GPT Realtime deployment (`"gpt-realtime"`) and Azure VoiceLive (`"voicelive"`). When `provider` is `"voicelive"` the backend simply mints the VoiceLive client secret and hands the WebSocket URL back to the browser without brokering the audio stream.
+
+> VoiceLive support currently expects a valid `AZURE_VOICELIVE_API_KEY`. If you plan to authenticate with Azure AD tokens you will need to extend the backend to obtain a bearer token and swap the request headers accordingly.
+
 ## Frontend: React Web Client
 
 The web UI is built with Vite + React + TypeScript. Configure the API URL (defaults to `http://localhost:8000`) by copying `web/.env.template` to `web/.env` and adjusting the value if needed.
@@ -82,7 +91,9 @@ Open the printed URL (default `http://localhost:5173`). You can:
 
 - Type some text and click **发送文字** for a quick audio reply.
 - Record a short clip with **开始录音 / 发送语音** and hear Zara answer with fresh audio.
-- Click **开始实时通话** to start a WebRTC session with the Azure realtime endpoint. The button flips to **结束实时通话** while connected so you can hang up at any time. Realtime mode negotiates SDP through the backend, streams microphone audio, and plays Zara’s voice as soon as she speaks. Make sure your environment variables include `AZURE_OPENAI_REALTIME_HOST`.
+- Pick **GPT Realtime** or **VoiceLive** before starting a realtime call. VoiceLive uses a direct WebSocket connection and automatically disables the WebRTC transport toggle.
+- Click **开始实时通话** to start the selected realtime transport. The button flips to **结束实时通话** while connected so you can hang up at any time. Realtime mode negotiates SDP through the backend, streams microphone audio, and plays Zara’s voice as soon as she speaks. Make sure your environment variables include `AZURE_OPENAI_REALTIME_HOST` (for GPT Realtime) or the VoiceLive counterparts when using VoiceLive. VoiceLive deployments hosted on Azure OpenAI typically expose the session API at `https://<resource-name>.cognitiveservices.azure.com/openai/voicelive/sessions?api-version=<version>`.
+- In bridged VoiceLive mode the browser connects to `ws://<backend>/api/voicelive/ws`; the FastAPI service handles the Azure VoiceLive SDK connection, so set `AZURE_VOICELIVE_API_KEY` and ensure the backend has the `azure-ai-voicelive` package installed.
 
 All captured audio is resampled to 24 kHz PCM16 before being forwarded to Azure.
 
