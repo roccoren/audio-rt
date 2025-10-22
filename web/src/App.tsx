@@ -671,6 +671,7 @@ export default function App(): JSX.Element {
     const payload = {
       audioBase64: uint8ToBase64(combined),
       sampleRate: TARGET_SAMPLE_RATE,
+      targetLanguages: ["zh", "en"],  // 支持中英文双向翻译
     };
     const timestamp = new Date().toISOString();
 

@@ -77,9 +77,13 @@ def _normalize_languages(languages: Optional[Iterable[str]]) -> Tuple[str, ...]:
     for lang in languages:
         if not lang:
             continue
-        cleaned = lang.strip()
-        if cleaned:
-            normalized.append(cleaned)
+        # Handle both regular comma (,) and Chinese comma (，)
+        # Split in case multiple languages are incorrectly joined
+        parts = lang.replace('，', ',').split(',')
+        for part in parts:
+            cleaned = part.strip()
+            if cleaned:
+                normalized.append(cleaned)
     return tuple(dict.fromkeys(normalized))
 
 
@@ -262,18 +266,10 @@ class LiveInterpreterTranslator:
                 self._logger.info("Using fixed source language: %s", recognition_language)
         else:
             if config.auto_detect_source_language:
-                languages = []
-                if config.default_source_language:
-                    languages.append(config.default_source_language)
-                if not languages:
-                    languages.append("en-US")
-                self._logger.debug("Auto-detect languages list: %s", languages)
-                if len(languages) >= 2:
-                    self._logger.info("Using auto-detect with languages: %s", languages)
-                    auto_detect_config = self._create_auto_detect_config(speechsdk, languages)
-                else:
-                    recognition_language = languages[0]
-                    self._logger.info("Using single language from auto-detect: %s", recognition_language)
+                # When auto-detect is enabled and no specific source languages are provided,
+                # use open range detection to allow Azure to detect any supported language
+                self._logger.info("Using auto-detect with open range (no specific source languages)")
+                auto_detect_config = self._create_auto_detect_config(speechsdk, [])
             else:
                 recognition_language = config.default_source_language or "en-US"
                 self._logger.info("Auto-detect disabled, using language: %s", recognition_language)
@@ -346,9 +342,33 @@ class LiveInterpreterTranslator:
         elif result.reason == speechsdk.ResultReason.RecognizedSpeech:
             recognized_text = result.text
         elif result.reason == speechsdk.ResultReason.NoMatch:
-            raise LiveInterpreterError("Speech could not be recognized by the translation service.")
+            # Provide more context for NoMatch errors
+            no_match_details = getattr(result, "no_match_details", None)
+            if no_match_details:
+                reason = getattr(no_match_details, "reason", None)
+                self._logger.warning("Speech recognition NoMatch reason: %s", reason)
+            self._logger.warning(
+                "Speech not recognized - audio_length=%d bytes, sample_rate=%d Hz, config=%s",
+                len(audio_bytes),
+                sample_rate_hz,
+                {
+                    "source_lang": config.source_languages or config.default_source_language,
+                    "target_langs": config.target_languages,
+                    "auto_detect": config.auto_detect_source_language,
+                },
+            )
+            raise LiveInterpreterError(
+                "Speech could not be recognized. This may be due to low audio quality, "
+                "background noise, or unsupported language. Please ensure clear audio input."
+            )
         elif result.reason == speechsdk.ResultReason.Canceled:
             error_details = cancellation_details or getattr(result.cancellation_details, "error_details", None)
+            cancellation_reason = getattr(result.cancellation_details, "reason", None) if hasattr(result, "cancellation_details") else None
+            self._logger.error(
+                "Translation canceled - reason=%s, error_details=%s",
+                cancellation_reason,
+                error_details,
+            )
             message = error_details or "Translation request was canceled."
             raise LiveInterpreterError(message)
 
