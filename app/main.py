@@ -3,6 +3,7 @@ import base64
 import binascii
 import json
 import logging
+from functools import lru_cache
 from typing import Literal, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -30,6 +31,11 @@ from src.voice_client import (
     load_voicelive_env_config,
     pcm16_to_wav_bytes,
 )
+from src.live_interpreter import (
+    LiveInterpreterError,
+    LiveInterpreterTranslator,
+    load_live_interpreter_config,
+)
 
 
 app = FastAPI(title="Zara Voice Service")
@@ -46,6 +52,12 @@ logger = logging.getLogger("zara.app")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
+
+
+@lru_cache()
+def _get_live_interpreter() -> LiveInterpreterTranslator:
+    config = load_live_interpreter_config()
+    return LiveInterpreterTranslator(config)
 
 
 class RespondRequest(BaseModel):
@@ -140,6 +152,43 @@ class RealtimeHandshakeResponse(BaseModel):
     session_id: Optional[str] = Field(default=None, alias="sessionId")
 
 
+class TranslateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    audio_base64: str = Field(alias="audioBase64", description="Base64-encoded PCM16 audio input.")
+    sample_rate: int = Field(alias="sampleRate", description="Sample rate (Hz) of the input audio.")
+    target_languages: Optional[list[str]] = Field(
+        default=None,
+        alias="targetLanguages",
+        description="Optional override for translation target language codes.",
+    )
+    voice: Optional[str] = Field(
+        default=None,
+        description="Optional Azure speech voice name for synthesized translation.",
+    )
+    source_language: Optional[str] = Field(
+        default=None,
+        alias="sourceLanguage",
+        description="Optional source language code when auto detection is disabled.",
+    )
+    auto_detect_source_language: Optional[bool] = Field(
+        default=None,
+        alias="autoDetectSourceLanguage",
+        description="Override to enable/disable automatic source language detection.",
+    )
+
+
+class TranslateResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    recognized_text: str = Field(alias="recognizedText")
+    translations: dict[str, str]
+    audio_base64: Optional[str] = Field(default=None, alias="audioBase64")
+    audio_format: Optional[str] = Field(default=None, alias="audioFormat")
+    audio_sample_rate: Optional[int] = Field(default=None, alias="audioSampleRate")
+    detected_source_language: Optional[str] = Field(default=None, alias="detectedSourceLanguage")
+
+
 @app.get("/healthz")
 async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
@@ -180,6 +229,56 @@ async def respond(payload: RespondRequest) -> RespondResponse:
         transcript=transcript,
         audioBase64=audio_base64,
         audioSampleRate=config.sample_rate_hz,
+    )
+
+
+@app.post("/api/translate", response_model=TranslateResponse)
+async def translate(payload: TranslateRequest) -> TranslateResponse:
+    if not payload.audio_base64:
+        raise HTTPException(status_code=400, detail="audioBase64 is required for translation.")
+    if payload.sample_rate <= 0:
+        raise HTTPException(status_code=400, detail="sampleRate must be a positive integer.")
+
+    try:
+        audio_bytes = base64.b64decode(payload.audio_base64)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="audioBase64 must be valid base64 data.") from exc
+
+    try:
+        interpreter = _get_live_interpreter()
+    except LiveInterpreterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        result = await interpreter.translate_audio(
+            audio_bytes=audio_bytes,
+            sample_rate_hz=payload.sample_rate,
+            target_languages=payload.target_languages,
+            voice_name=payload.voice,
+            source_language=payload.source_language,
+            auto_detect=payload.auto_detect_source_language,
+        )
+    except LiveInterpreterError as exc:
+        logger.error("Live Interpreter error: %s", str(exc), exc_info=True)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected Live Interpreter failure: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while processing the translation request.",
+        ) from exc
+
+    translated_audio_base64 = None
+    if result.audio_data:
+        translated_audio_base64 = base64.b64encode(result.audio_data).decode("ascii")
+
+    return TranslateResponse(
+        recognizedText=result.recognized_text,
+        translations=result.translations,
+        audioBase64=translated_audio_base64,
+        audioFormat=result.audio_format,
+        audioSampleRate=result.audio_sample_rate,
+        detectedSourceLanguage=result.detected_source_language,
     )
 
 

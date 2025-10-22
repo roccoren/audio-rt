@@ -5,7 +5,7 @@ const TARGET_SAMPLE_RATE = 24000;
 
 type ConversationMode = "text" | "voice" | "call";
 type CallTransport = "webrtc" | "websocket";
-type CallProvider = "gpt-realtime" | "voicelive";
+type CallProvider = "gpt-realtime" | "voicelive" | "live-interpreter";
 
 const MODE_OPTIONS: Array<{ value: ConversationMode; label: string; description: string }> = [
   { value: "text", label: "文字 → 语音", description: "键入内容，Zara 用语音回复。" },
@@ -51,6 +51,15 @@ type RealtimeResponseState = {
   audioChunks: Uint8Array[];
   textParts: string[];
   timestamp: string;
+};
+
+type TranslateResponse = {
+  recognizedText: string;
+  translations: Record<string, string>;
+  audioBase64?: string | null;
+  audioFormat?: string | null;
+  audioSampleRate?: number | null;
+  detectedSourceLanguage?: string | null;
 };
 
 const ZARA_INSTRUCTIONS =
@@ -198,6 +207,23 @@ function calculateRms(samples: Float32Array): number {
     sum += sample * sample;
   }
   return Math.sqrt(sum / samples.length);
+}
+
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+  if (!chunks.length) {
+    return new Uint8Array(0);
+  }
+  let total = 0;
+  chunks.forEach((chunk) => {
+    total += chunk.byteLength;
+  });
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  });
+  return combined;
 }
 
 function collectTextCandidates(value: unknown, parts: string[]): void {
@@ -401,6 +427,9 @@ export default function App(): JSX.Element {
   const callAwaitingResponseRef = useRef(false);
   const callHasSpeechSinceCommitRef = useRef(false);
   const callResponseStateRef = useRef<Map<string, RealtimeResponseState>>(new Map());
+  const liveInterpreterPendingChunksRef = useRef<Uint8Array[]>([]);
+  const liveInterpreterSendingRef = useRef(false);
+  const liveInterpreterSequenceRef = useRef(0);
 
   const awaitIceGatheringComplete = useCallback(
     (peer: RTCPeerConnection) =>
@@ -446,6 +475,9 @@ export default function App(): JSX.Element {
       }
       if (callStatus === "connected") {
         return "实时通话进行中，说话即可被 Zara 听到。";
+      }
+      if (callProvider === "live-interpreter") {
+        return "Live Interpreter 将把你的语音翻译成目标语言并播报译文。";
       }
       if (callProvider === "voicelive") {
         return "选择 VoiceLive 后将通过 WebSocket 直接连接 Azure VoiceLive。";
@@ -510,6 +542,9 @@ export default function App(): JSX.Element {
     callStreamingStateRef.current = "idle";
     callPlaybackTimeRef.current = 0;
     callResponseStateRef.current.clear();
+    liveInterpreterPendingChunksRef.current = [];
+    liveInterpreterSendingRef.current = false;
+    liveInterpreterSequenceRef.current = 0;
     setCallTranscripts({});
   }, []);
 
@@ -567,6 +602,7 @@ export default function App(): JSX.Element {
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
       remoteAudioRef.current.pause();
+      remoteAudioRef.current.src = "";
     }
   }, []);
 
@@ -602,8 +638,252 @@ export default function App(): JSX.Element {
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
       remoteAudioRef.current.pause();
+      remoteAudioRef.current.src = "";
     }
   }, []);
+
+  const sendLiveInterpreterRequest = useCallback(async () => {
+    if (callProvider !== "live-interpreter") {
+      return;
+    }
+    if (liveInterpreterSendingRef.current) {
+      return;
+    }
+    const pending = liveInterpreterPendingChunksRef.current;
+    if (!pending.length) {
+      callAwaitingResponseRef.current = false;
+      callStreamingStateRef.current = "idle";
+      callHasSpeechSinceCommitRef.current = false;
+      return;
+    }
+
+    const chunks = pending.slice();
+    liveInterpreterPendingChunksRef.current = [];
+    const combined = concatUint8Arrays(chunks);
+    if (!combined.length) {
+      callAwaitingResponseRef.current = false;
+      callStreamingStateRef.current = "idle";
+      callHasSpeechSinceCommitRef.current = false;
+      return;
+    }
+
+    liveInterpreterSendingRef.current = true;
+    const payload = {
+      audioBase64: uint8ToBase64(combined),
+      sampleRate: TARGET_SAMPLE_RATE,
+    };
+    const timestamp = new Date().toISOString();
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/translate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || "Translation request failed.");
+      }
+      const data = (await response.json()) as TranslateResponse;
+      const translationEntries = Object.entries(data.translations ?? {}).filter(
+        ([, text]) => typeof text === "string" && text.trim(),
+      );
+      const primaryTranslation = translationEntries.length > 0 ? translationEntries[0][1] : "";
+      const displayText = primaryTranslation || data.recognizedText || "翻译完成。";
+
+      let audioUrl: string | undefined;
+      if (data.audioBase64) {
+        try {
+          const audioBlob = base64ToBlob(data.audioBase64, "audio/wav");
+          audioUrl = URL.createObjectURL(audioBlob);
+          const audioContext = callAudioContextRef.current;
+          const destination = callDestinationRef.current;
+          if (audioContext && destination) {
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            const decoded = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+            const source = audioContext.createBufferSource();
+            source.buffer = decoded;
+            source.connect(destination);
+            const startAt = Math.max(callPlaybackTimeRef.current, audioContext.currentTime);
+            source.start(startAt);
+            callPlaybackTimeRef.current = startAt + decoded.duration;
+          } else {
+            const fallbackAudio = new Audio(audioUrl);
+            fallbackAudio.play().catch(() => undefined);
+          }
+        } catch (decodeError) {
+          console.error("Live Interpreter audio playback failed", decodeError);
+          if (audioUrl) {
+            const fallbackAudio = new Audio(audioUrl);
+            fallbackAudio.play().catch(() => undefined);
+          }
+        }
+      }
+
+      const message: Message = {
+        id: uuid(),
+        role: "zara",
+        text: displayText,
+        audioUrl,
+        timestamp,
+      };
+      setHistory((prev) => [...prev, message]);
+
+      const transcriptLines: string[] = [];
+      if (data.detectedSourceLanguage && data.detectedSourceLanguage.trim()) {
+        transcriptLines.push(`检测到语言：${data.detectedSourceLanguage}`);
+      }
+      if (data.recognizedText && data.recognizedText.trim()) {
+        transcriptLines.push(`原文：${data.recognizedText}`);
+      }
+      translationEntries.forEach(([language, text]) => {
+        transcriptLines.push(`译文（${language}）：${text}`);
+      });
+      const transcriptText = transcriptLines.join("\n") || displayText;
+
+      setCallTranscripts((prev) => ({
+        ...prev,
+        [message.id]: {
+          text: transcriptText,
+          isFinal: true,
+          timestamp,
+        },
+      }));
+    } catch (translationError) {
+      console.error("Live Interpreter translation failed", translationError);
+      setError("Live Interpreter 翻译失败，请稍后重试。");
+    } finally {
+      callAwaitingResponseRef.current = false;
+      callStreamingStateRef.current = "idle";
+      callHasSpeechSinceCommitRef.current = false;
+      callLastVoiceActivityRef.current = performance.now();
+      liveInterpreterSendingRef.current = false;
+    }
+  }, [callProvider, setCallTranscripts, setError, setHistory]);
+
+  const startLiveInterpreterCall = useCallback(async () => {
+    if (callStatus !== "idle") {
+      return;
+    }
+    if (callProvider !== "live-interpreter") {
+      return;
+    }
+    setError(null);
+    setCallStatus("connecting");
+    try {
+      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      callLocalStreamRef.current = localStream;
+
+      let createdAudioContext: AudioContext | null = null;
+      try {
+        createdAudioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      } catch (audioContextError) {
+        console.warn("Falling back to default AudioContext sample rate.", audioContextError);
+        createdAudioContext = new AudioContext();
+      }
+      const audioContext = createdAudioContext;
+      callAudioContextRef.current = audioContext;
+      callPlaybackTimeRef.current = audioContext.currentTime;
+      callStreamingStateRef.current = "idle";
+      callAwaitingResponseRef.current = false;
+      callHasSpeechSinceCommitRef.current = false;
+      callLastVoiceActivityRef.current = performance.now();
+      liveInterpreterPendingChunksRef.current = [];
+      liveInterpreterSendingRef.current = false;
+      liveInterpreterSequenceRef.current = 0;
+
+      try {
+        await audioContext.resume();
+      } catch {
+        /* resume failures can be ignored */
+      }
+
+      const source = audioContext.createMediaStreamSource(localStream);
+      const processor = audioContext.createScriptProcessor(STREAM_BUFFER_SIZE, source.channelCount, 1);
+      callProcessorRef.current = processor;
+      const silenceGain = audioContext.createGain();
+      silenceGain.gain.value = 0;
+      processor.connect(silenceGain);
+      silenceGain.connect(audioContext.destination);
+      source.connect(processor);
+
+      const destination = audioContext.createMediaStreamDestination();
+      callDestinationRef.current = destination;
+
+      const remoteAudio = remoteAudioRef.current;
+      if (remoteAudio) {
+        remoteAudio.srcObject = destination.stream;
+        remoteAudio.muted = false;
+        try {
+          await remoteAudio.play();
+        } catch {
+          /* ignore autoplay issues */
+        }
+      }
+
+      setCallStatus("connected");
+
+      processor.onaudioprocess = (audioEvent: AudioProcessingEvent) => {
+        const { inputBuffer } = audioEvent;
+        const frameLength = inputBuffer.length;
+        if (!frameLength) {
+          return;
+        }
+        const channelCount = inputBuffer.numberOfChannels;
+        const mixed = new Float32Array(frameLength);
+        for (let channel = 0; channel < channelCount; channel++) {
+          const channelData = inputBuffer.getChannelData(channel);
+          for (let i = 0; i < frameLength; i++) {
+            mixed[i] += channelData[i];
+          }
+        }
+        if (channelCount > 1) {
+          for (let i = 0; i < frameLength; i++) {
+            mixed[i] /= channelCount;
+          }
+        }
+
+        const rms = calculateRms(mixed);
+        const resampled = resample(mixed, audioContext.sampleRate, TARGET_SAMPLE_RATE);
+        if (!resampled.length) {
+          return;
+        }
+        const pcm16 = floatTo16BitPCM(resampled);
+        if (!pcm16.length) {
+          return;
+        }
+
+        const chunkCopy = new Uint8Array(pcm16.buffer.slice(0));
+        liveInterpreterPendingChunksRef.current.push(chunkCopy);
+
+        const now = performance.now();
+        if (rms > SILENCE_THRESHOLD) {
+          callLastVoiceActivityRef.current = now;
+          callHasSpeechSinceCommitRef.current = true;
+          if (callStreamingStateRef.current !== "speaking") {
+            callStreamingStateRef.current = "speaking";
+          }
+        } else if (callStreamingStateRef.current === "speaking") {
+          if (now - callLastVoiceActivityRef.current >= SILENCE_DURATION_MS) {
+            if (!callAwaitingResponseRef.current && callHasSpeechSinceCommitRef.current) {
+              callStreamingStateRef.current = "awaiting_response";
+              callAwaitingResponseRef.current = true;
+              callHasSpeechSinceCommitRef.current = false;
+              void sendLiveInterpreterRequest();
+            }
+          }
+        }
+      };
+    } catch (callError) {
+      console.error(callError);
+      setError("Live Interpreter 连接失败，请稍后再试。");
+      stopWebsocketCall();
+      setCallStatus("idle");
+      resetRealtimeState();
+    }
+  }, [callProvider, callStatus, resetRealtimeState, sendLiveInterpreterRequest, setError, stopWebsocketCall]);
 
   const stopCall = useCallback(() => {
     if (callTransport === "webrtc") {
@@ -1309,17 +1589,21 @@ export default function App(): JSX.Element {
   }, [callProvider, callStatus, handleRealtimeWsEvent, resetRealtimeState, stopWebsocketCall]);
 
   const startCall = useCallback(async () => {
+    if (callProvider === "live-interpreter") {
+      await startLiveInterpreterCall();
+      return;
+    }
     if (callTransport === "webrtc") {
       await startWebrtcCall();
     } else {
       await startWebsocketCall();
     }
-  }, [callTransport, startWebrtcCall, startWebsocketCall]);
+  }, [callProvider, callTransport, startLiveInterpreterCall, startWebrtcCall, startWebsocketCall]);
 
   const callActive = callStatus === "connected" || callStatus === "connecting";
 
   useEffect(() => {
-    if (callProvider === "voicelive" && callTransport === "webrtc") {
+    if (callTransport === "webrtc" && callProvider !== "gpt-realtime") {
       setCallTransport("websocket");
     }
   }, [callProvider, callTransport]);
@@ -1555,6 +1839,17 @@ export default function App(): JSX.Element {
                   />
                   <span>VoiceLive</span>
                 </label>
+                <label className="transport-option" style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+                  <input
+                    type="radio"
+                    name="call-provider"
+                    value="live-interpreter"
+                    checked={callProvider === "live-interpreter"}
+                    onChange={handleProviderChange}
+                    disabled={callActive}
+                  />
+                  <span>Live Interpreter</span>
+                </label>
               </div>
               <div
                 className="transport-options"
@@ -1570,7 +1865,7 @@ export default function App(): JSX.Element {
                     value="webrtc"
                     checked={callTransport === "webrtc"}
                     onChange={handleTransportChange}
-                    disabled={callActive || callProvider === "voicelive"}
+                    disabled={callActive || callProvider !== "gpt-realtime"}
                   />
                   <span>WebRTC</span>
                 </label>
@@ -1597,9 +1892,11 @@ export default function App(): JSX.Element {
                 </button>
               </div>
               <p className="helper-text">
-                {callProvider === "voicelive"
-                  ? "VoiceLive 使用 WebSocket 直连，请确保浏览器已授权麦克风。"
-                  : "启动后 Zara 会实时倾听与回应，建议佩戴耳机防止回声。"}
+                {callProvider === "live-interpreter"
+                  ? "Live Interpreter 会在检测到停顿时把你的语音发送到翻译服务，并播放译文语音。"
+                  : callProvider === "voicelive"
+                    ? "VoiceLive 使用 WebSocket 直连，请确保浏览器已授权麦克风。"
+                    : "启动后 Zara 会实时倾听与回应，建议佩戴耳机防止回声。"}
               </p>
               <div className="audio-player" style={{ marginTop: "0.75rem" }}>
                 <audio ref={remoteAudioRef} autoPlay playsInline />

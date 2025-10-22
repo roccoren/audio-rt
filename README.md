@@ -23,6 +23,15 @@ This workspace contains a Python service and a modern React web app that talk to
     - `AZURE_VOICELIVE_MODEL`
     - `AZURE_VOICELIVE_API_VERSION` (defaults to `2025-10-01`)
     - `AZURE_VOICELIVE_API_KEY` (required when not using AAD credentials)
+  - Optional Live Interpreter translation:
+    - `AZURE_SPEECH_TRANSLATION_KEY` (defaults to `AZURE_SPEECH_KEY` when present)
+    - `AZURE_SPEECH_TRANSLATION_ENDPOINT` or `AZURE_SPEECH_TRANSLATION_REGION`
+    - Optional overrides:
+      - `AZURE_SPEECH_TRANSLATION_VOICE`
+      - `AZURE_SPEECH_TRANSLATION_TARGET_LANGUAGES` (comma separated, default `en`)
+      - `AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGE` (default recognition language, default `en-US`)
+      - `AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES` (comma separated)
+      - `AZURE_SPEECH_TRANSLATION_AUTO_DETECT` (defaults to `true`)
   - Optional personal voice support:
     - `AZURE_SPEECH_KEY`
     - `AZURE_SPEECH_REGION`
@@ -71,6 +80,8 @@ PYTHONPATH=. uvicorn app.main:app --reload
 ```
 
 The service expects base64-encoded 16-bit PCM audio and returns a WAV-encoded reply along with the transcript. For realtime calls it creates an ephemeral session (`/api/realtime/session`) and relays the SDP offer/answer exchange (`/api/realtime/handshake`). CORS is open for local development.
+
+`/api/translate` accepts base64-encoded PCM audio and relays it to the Azure Speech translation (Live Interpreter) endpoint. It returns the recognized source text, a map of target language translations, and—when a voice is configured—the synthesized translation audio as base64-encoded WAV.
 
 `/api/realtime/session` accepts a `provider` field so you can choose between the default GPT Realtime deployment (`"gpt-realtime"`) and Azure VoiceLive (`"voicelive"`). When `provider` is `"voicelive"` the backend simply mints the VoiceLive client secret and hands the WebSocket URL back to the browser without brokering the audio stream.
 
