@@ -3,6 +3,7 @@ import base64
 import binascii
 import json
 import logging
+import threading
 from functools import lru_cache
 from typing import Literal, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -11,6 +12,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from azure.ai.voicelive.aio import connect as voicelive_connect
 from azure.ai.voicelive.models import (
@@ -35,6 +40,11 @@ from src.live_interpreter import (
     LiveInterpreterError,
     LiveInterpreterTranslator,
     load_live_interpreter_config,
+)
+from src.live_interpreter_streaming import (
+    LiveInterpreterStreamingSession,
+    StreamingTranslationConfig,
+    load_streaming_config_from_env,
 )
 
 
@@ -989,3 +999,182 @@ async def realtime_session(payload: RealtimeSessionRequest) -> RealtimeSessionRe
         wsProtocols=websocket_protocols,
         sessionExpiresAt=str(session_expires_at) if session_expires_at is not None else None,
     )
+
+
+# Global storage for streaming sessions (one per WebSocket connection)
+streaming_sessions: dict[str, LiveInterpreterStreamingSession] = {}
+
+
+@app.websocket("/api/live-interpreter/ws")
+async def live_interpreter_websocket(websocket: WebSocket) -> None:
+    """WebSocket endpoint for continuous Live Interpreter translation."""
+    await websocket.accept()
+    
+    session_id = f"session_{id(websocket)}"
+    session: Optional[LiveInterpreterStreamingSession] = None
+    
+    try:
+        # Parse query parameters for configuration
+        query_string = websocket.scope.get("query_string", b"").decode("utf-8")
+        from urllib.parse import parse_qs
+        query_params = parse_qs(query_string)
+        
+        target_lang = query_params.get("target_lang", ["en"])[0]
+        
+        # Load base config from environment
+        try:
+            base_config = load_streaming_config_from_env()
+        except Exception as config_error:
+            logger.exception("Failed to load streaming config: %s", config_error)
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Configuration error: {config_error}"
+            })
+            await websocket.close(code=1011, reason="Configuration error")
+            return
+        
+        # Override target language from query param
+        config = StreamingTranslationConfig(
+            subscription_key=base_config.subscription_key,
+            region=base_config.region,
+            target_language=target_lang,
+            voice_name=base_config.voice_name,
+            speaker_profile_id=base_config.speaker_profile_id,
+            auto_detect=base_config.auto_detect
+        )
+        
+        logger.info(
+            "Starting Live Interpreter streaming session: session_id=%s, target=%s",
+            session_id, target_lang
+        )
+        
+        # Create and start session
+        session = LiveInterpreterStreamingSession(config)
+        streaming_sessions[session_id] = session
+        
+        # Start continuous recognition in background thread
+        def start_recognition():
+            try:
+                session.start()
+            except Exception as start_error:
+                logger.exception("Failed to start recognition: %s", start_error)
+        
+        recognition_thread = threading.Thread(target=start_recognition, daemon=True)
+        recognition_thread.start()
+        
+        # Wait a bit for session to start
+        await asyncio.sleep(0.5)
+        
+        # Create tasks for sending events and audio to client
+        async def forward_translation_events():
+            """Forward translation events to WebSocket client."""
+            while True:
+                try:
+                    # Run blocking queue.get in thread pool
+                    event = await asyncio.get_event_loop().run_in_executor(
+                        None, session.get_event, 1.0
+                    )
+                    
+                    if event is None:
+                        continue
+                    
+                    # Convert event to dict for JSON serialization
+                    event_dict = {
+                        "type": event.event_type,
+                        "detectedLanguage": event.detected_language,
+                        "originalText": event.original_text,
+                        "translation": event.translation,
+                        "audioBase64": event.audio_base64,
+                        "offset": event.offset,
+                        "duration": event.duration,
+                        "errorMessage": event.error_message,
+                    }
+                    
+                    # Remove None values
+                    event_dict = {k: v for k, v in event_dict.items() if v is not None}
+                    
+                    await websocket.send_json(event_dict)
+                    
+                    # Stop if session ended
+                    if event.event_type in ('stopped', 'session_stopped'):
+                        break
+                        
+                except WebSocketDisconnect:
+                    break
+                except Exception as fwd_error:
+                    logger.exception("Error forwarding event: %s", fwd_error)
+                    break
+        
+        async def receive_audio_data():
+            """Receive audio data from WebSocket client and push to recognizer."""
+            while True:
+                try:
+                    message = await websocket.receive_json()
+                    
+                    if message.get("type") == "audio_data":
+                        audio_b64 = message.get("audio")
+                        if audio_b64:
+                            try:
+                                audio_bytes = base64.b64decode(audio_b64)
+                                # Push audio in thread pool to avoid blocking
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, session.push_audio, audio_bytes
+                                )
+                            except Exception as audio_error:
+                                logger.error("Error processing audio: %s", audio_error)
+                    
+                    elif message.get("type") == "stop":
+                        logger.info("Client requested stop")
+                        break
+                        
+                except WebSocketDisconnect:
+                    break
+                except Exception as recv_error:
+                    logger.exception("Error receiving audio: %s", recv_error)
+                    break
+        
+        # Run both tasks concurrently
+        forward_task = asyncio.create_task(forward_translation_events())
+        receive_task = asyncio.create_task(receive_audio_data())
+        
+        # Wait for either task to complete
+        done, pending = await asyncio.wait(
+            [forward_task, receive_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info("Live Interpreter WebSocket session ended: %s", session_id)
+        
+    except WebSocketDisconnect:
+        logger.info("Client disconnected: %s", session_id)
+    except Exception as ws_error:
+        logger.exception("Live Interpreter WebSocket error: %s", ws_error)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"WebSocket error: {ws_error}"
+            })
+        except Exception:
+            pass
+    finally:
+        # Clean up session
+        if session:
+            try:
+                session.stop()
+            except Exception as stop_error:
+                logger.error("Error stopping session: %s", stop_error)
+        
+        streaming_sessions.pop(session_id, None)
+        
+        try:
+            await websocket.close(code=1000)
+        except Exception:
+            pass

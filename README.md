@@ -27,12 +27,13 @@ This workspace contains a Python service and a modern React web app that talk to
     - `AZURE_SPEECH_TRANSLATION_KEY` (defaults to `AZURE_SPEECH_KEY` when present)
     - `AZURE_SPEECH_TRANSLATION_ENDPOINT` or `AZURE_SPEECH_TRANSLATION_REGION`
     - Optional overrides:
-      - `AZURE_SPEECH_TRANSLATION_VOICE`
+      - `AZURE_SPEECH_TRANSLATION_VOICE` (set to `personal-voice` when using Personal Voice)
+      - `AZURE_SPEECH_TRANSLATION_PERSONAL_VOICE_NAME` (override the personal voice identifier, default `personal-voice`)
       - `AZURE_SPEECH_TRANSLATION_TARGET_LANGUAGES` (comma separated, default `en`)
       - `AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGE` (default recognition language, default `en-US`)
       - `AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES` (comma separated)
       - `AZURE_SPEECH_TRANSLATION_AUTO_DETECT` (defaults to `true`)
-  - Optional personal voice support:
+  - Optional personal voice support (reused by Live Interpreter when present):
     - `AZURE_SPEECH_KEY`
     - `AZURE_SPEECH_REGION`
     - `AZURE_SPEECH_SPEAKER_PROFILE_ID` (speaker profile created via Azure Personal Voice)
@@ -163,6 +164,8 @@ If you have created a Personal Voice speaker profile via Azure Speech, the backe
    ```
 
 With the values in place, every reply streamed from Azure OpenAI is re-synthesized locally using the Personal Voice speaker profile before being returned to the browser/CLI. Remove or unset the speech environment variables to fall back to the stock Azure OpenAI voices.
+
+The same speaker profile settings also enable Personal Voice synthesis for Azure Speech Live Interpreter. Set `AZURE_SPEECH_TRANSLATION_VOICE="personal-voice"` (or override with `AZURE_SPEECH_TRANSLATION_PERSONAL_VOICE_NAME`) and the backend will automatically route translation requests to the universal/v2 endpoint with the zero-shot TTS flight enabled.
 
 ## Files
 

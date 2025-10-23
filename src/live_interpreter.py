@@ -3,7 +3,7 @@ import functools
 import io
 import logging
 import os
-import tempfile
+import threading
 import wave
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -11,6 +11,16 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 class LiveInterpreterError(RuntimeError):
     """Raised when the Azure Live Interpreter translation flow fails."""
+
+
+@dataclass(frozen=True)
+class LiveInterpreterPersonalVoiceConfig:
+    """Optional personal voice settings for Live Interpreter synthesis."""
+
+    speaker_profile_id: str
+    voice_name: str = "personal-voice"
+    style: Optional[str] = None
+    language: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,7 @@ class LiveInterpreterConfig:
     source_languages: Optional[Tuple[str, ...]] = None
     auto_detect_source_language: bool = True
     default_source_language: Optional[str] = None
+    personal_voice: Optional[LiveInterpreterPersonalVoiceConfig] = None
 
     def with_overrides(
         self,
@@ -54,6 +65,7 @@ class LiveInterpreterConfig:
             source_languages=sources,
             auto_detect_source_language=self.auto_detect_source_language if auto_detect is None else auto_detect,
             default_source_language=self.default_source_language,
+            personal_voice=self.personal_voice,
         )
 
 
@@ -162,6 +174,33 @@ def load_live_interpreter_config() -> LiveInterpreterConfig:
         default=True,
     )
 
+    personal_voice: Optional[LiveInterpreterPersonalVoiceConfig] = None
+    speaker_profile_id = (
+        _load_env_var("AZURE_SPEECH_SPEAKER_PROFILE_ID")
+        or _load_env_var("AZURE_PERSONAL_VOICE_SPEAKER_PROFILE_ID")
+        or _load_env_var("AZURE_PERSONAL_VOICE_ID")
+    )
+    if speaker_profile_id:
+        cleaned_profile_id = speaker_profile_id.strip()
+        if not cleaned_profile_id:
+            raise LiveInterpreterError("Personal voice speaker profile id is empty.")
+        personal_voice_voice_name = (
+            _load_env_var("AZURE_SPEECH_TRANSLATION_PERSONAL_VOICE_NAME")
+            or voice_name
+            or "personal-voice"
+        )
+        personal_voice = LiveInterpreterPersonalVoiceConfig(
+            speaker_profile_id=cleaned_profile_id,
+            voice_name=personal_voice_voice_name,
+            style=_load_env_var("AZURE_SPEECH_VOICE_STYLE"),
+            language=_load_env_var("AZURE_SPEECH_LANGUAGE"),
+        )
+        if not voice_name:
+            voice_name = personal_voice.voice_name
+
+    if not endpoint and region:
+        endpoint = f"wss://{region}.stt.speech.microsoft.com/speech/universal/v2?setfeature=zeroshotttsflight"
+
     return LiveInterpreterConfig(
         subscription_key=subscription_key,
         endpoint=endpoint,
@@ -171,6 +210,7 @@ def load_live_interpreter_config() -> LiveInterpreterConfig:
         source_languages=source_languages if source_languages else None,
         auto_detect_source_language=auto_detect,
         default_source_language=default_source_language,
+        personal_voice=personal_voice,
     )
 
 
@@ -232,6 +272,8 @@ class LiveInterpreterTranslator:
         *,
         config: LiveInterpreterConfig,
     ) -> TranslationResult:
+        if not audio_bytes:
+            raise LiveInterpreterError("Audio data is required for translation.")
         self._logger.info(
             "Starting translation - endpoint=%s, region=%s, target_langs=%s, source_lang=%s, voice=%s, auto_detect=%s",
             config.endpoint,
@@ -244,44 +286,46 @@ class LiveInterpreterTranslator:
         speechsdk = self._ensure_speechsdk()
         translation_config = self._create_translation_config(speechsdk, config)
 
-        wav_path = self._write_temp_wav(audio_bytes, sample_rate_hz)
-        audio_config = speechsdk.audio.AudioConfig(filename=wav_path)
-
-        recognizer_kwargs = {
-            "translation_config": translation_config,
-            "audio_config": audio_config,
-        }
+        recognizer_kwargs: Dict[str, object] = {"translation_config": translation_config}
 
         auto_detect_config = None
         recognition_language: Optional[str] = None
 
-        if config.source_languages:
-            unique_sources = tuple(dict.fromkeys(config.source_languages))
-            self._logger.debug("Source languages provided: %s", unique_sources)
-            if config.auto_detect_source_language and len(unique_sources) > 1:
-                self._logger.info("Using auto-detect with multiple source languages: %s", unique_sources)
-                auto_detect_config = self._create_auto_detect_config(speechsdk, unique_sources)
-            else:
-                recognition_language = unique_sources[0]
-                self._logger.info("Using fixed source language: %s", recognition_language)
-        else:
-            if config.auto_detect_source_language:
-                # When auto-detect is enabled and no specific source languages are provided,
-                # use open range detection to allow Azure to detect any supported language
-                self._logger.info("Using auto-detect with open range (no specific source languages)")
-                auto_detect_config = self._create_auto_detect_config(speechsdk, [])
-            else:
-                recognition_language = config.default_source_language or "en-US"
-                self._logger.info("Auto-detect disabled, using language: %s", recognition_language)
+        if config.auto_detect_source_language:
+            source_candidates = config.source_languages or tuple()
+            try:
+                auto_detect_config = self._create_auto_detect_config(speechsdk, source_candidates)
+            except LiveInterpreterError as exc:
+                if source_candidates:
+                    self._logger.warning(
+                        "Falling back to fixed recognition language after auto-detect error: %s",
+                        exc,
+                    )
+                    recognition_language = source_candidates[0]
+                else:
+                    raise
 
-        # CRITICAL: Do NOT set speech_recognition_language when using auto_detect_config
-        # This causes SPXERR_INVALID_ARG error
-        if auto_detect_config is not None:
-            self._logger.info("Adding auto_detect_source_language_config to recognizer")
-            recognizer_kwargs["auto_detect_source_language_config"] = auto_detect_config
+        if not config.auto_detect_source_language or auto_detect_config is None:
+            recognition_language = (
+                recognition_language
+                or (config.source_languages[0] if config.source_languages else None)
+                or config.default_source_language
+                or "en-US"
+            )
+            translation_config.speech_recognition_language = recognition_language
+            self._logger.info("Using fixed recognition language: %s", recognition_language)
         else:
-            self._logger.info("Setting speech_recognition_language=%s", recognition_language or "en-US")
-            translation_config.speech_recognition_language = recognition_language or "en-US"
+            recognizer_kwargs["auto_detect_source_language_config"] = auto_detect_config
+            self._logger.info("Auto language detection enabled (open range).")
+
+        audio_format = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=sample_rate_hz,
+            bits_per_sample=16,
+            channels=1,
+        )
+        push_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
+        audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
+        recognizer_kwargs["audio_config"] = audio_config
 
         recognizer = speechsdk.translation.TranslationRecognizer(**recognizer_kwargs)
 
@@ -289,19 +333,43 @@ class LiveInterpreterTranslator:
         translations: Dict[str, str] = {}
         synthesized_audio = bytearray()
         detected_language: Optional[str] = None
-        cancellation_details: Optional[str] = None
+        error_message: Optional[str] = None
+
+        result_ready = threading.Event()
+        session_stopped = threading.Event()
+
+        def _mark_result_ready() -> None:
+            if not result_ready.is_set():
+                result_ready.set()
 
         def _handle_recognized(evt):
-            nonlocal recognized_text, translations, detected_language
+            nonlocal recognized_text, translations, detected_language, error_message
             result = getattr(evt, "result", None)
             if not result:
                 return
-            if getattr(result, "text", None):
-                recognized_text = result.text
-            if getattr(result, "translations", None):
+
+            detected_language = result.properties.get(
+                speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult,
+                getattr(result, "language", None),
+            )
+
+            if result.reason == speechsdk.ResultReason.TranslatedSpeech:
+                recognized_text = result.text or recognized_text
                 translations = dict(result.translations)
-            if getattr(result, "language", None):
-                detected_language = result.language
+                _mark_result_ready()
+            elif result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                recognized_text = result.text or recognized_text
+                translations = dict(result.translations)
+                _mark_result_ready()
+            elif result.reason == speechsdk.ResultReason.NoMatch:
+                no_match_details = getattr(result, "no_match_details", None)
+                detail_reason = getattr(no_match_details, "reason", None) if no_match_details else None
+                self._logger.warning("Speech recognition NoMatch reason: %s", detail_reason)
+                error_message = (
+                    "Speech could not be recognized. This may be due to low audio quality, "
+                    "background noise, or unsupported language. Please ensure clear audio input."
+                )
+                _mark_result_ready()
 
         def _handle_synthesizing(evt):
             data = getattr(evt, "result", None)
@@ -312,71 +380,75 @@ class LiveInterpreterTranslator:
                 synthesized_audio.extend(audio)
 
         def _handle_canceled(evt):
-            nonlocal cancellation_details
+            nonlocal error_message
             result = getattr(evt, "result", None)
-            if result and hasattr(result, "error_details") and result.error_details:
-                cancellation_details = result.error_details
+            if result and getattr(result, "error_details", None):
+                error_message = result.error_details
+            reason = getattr(evt, "reason", None)
+            cancellation_details = getattr(evt, "cancellation_details", None)
+            details_message: Optional[str] = None
+            if cancellation_details is not None:
+                error_details = getattr(cancellation_details, "error_details", None)
+                if error_details:
+                    details_message = error_details
+                else:
+                    details_message = str(getattr(cancellation_details, "reason", "") or "")
+            if not error_message and result is not None:
+                try:
+                    cancellation = speechsdk.CancellationDetails.from_result(result)
+                except Exception:
+                    cancellation = None
+                if cancellation is not None and getattr(cancellation, "error_details", None):
+                    details_message = cancellation.error_details
+            if details_message:
+                error_message = details_message
+            if not error_message:
+                error_message = f"Translation canceled ({reason})" if reason else "Translation canceled unexpectedly."
+            self._logger.error("Translation canceled: %s", reason or "Unknown")
+            _mark_result_ready()
+            session_stopped.set()
+
+        def _handle_session_stopped(_: object) -> None:
+            session_stopped.set()
 
         recognizer.recognized.connect(_handle_recognized)
         recognizer.synthesizing.connect(_handle_synthesizing)
         recognizer.canceled.connect(_handle_canceled)
+        recognizer.session_stopped.connect(_handle_session_stopped)
 
-        self._logger.debug("Starting recognition with kwargs: %s", list(recognizer_kwargs.keys()))
+        def _push_audio() -> None:
+            try:
+                push_stream.write(audio_bytes)
+            finally:
+                push_stream.close()
+
+        feeder = threading.Thread(target=_push_audio, name="LiveInterpreterFeeder", daemon=True)
+
+        self._logger.debug("Starting continuous recognition with kwargs: %s", list(recognizer_kwargs.keys()))
         try:
-            result = recognizer.recognize_once_async().get()
-            self._logger.debug("Recognition completed with reason: %s", result.reason)
+            recognizer.start_continuous_recognition()
+            feeder.start()
+            if not result_ready.wait(timeout=60):
+                error_message = "Timed out waiting for Azure Speech translation."
+            recognizer.stop_continuous_recognition()
+            session_stopped.wait(timeout=5)
         except Exception as recognition_error:
             self._logger.error("Recognition failed: %s", recognition_error, exc_info=True)
             raise
         finally:
             try:
-                os.remove(wav_path)
-            except OSError:
+                feeder.join(timeout=1)
+            except RuntimeError:
                 pass
 
-        if result.reason == speechsdk.ResultReason.TranslatedSpeech:
-            recognized_text = result.text
-            translations = dict(result.translations)
-            if hasattr(result, "language"):
-                detected_language = result.language
-        elif result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            recognized_text = result.text
-        elif result.reason == speechsdk.ResultReason.NoMatch:
-            # Provide more context for NoMatch errors
-            no_match_details = getattr(result, "no_match_details", None)
-            if no_match_details:
-                reason = getattr(no_match_details, "reason", None)
-                self._logger.warning("Speech recognition NoMatch reason: %s", reason)
-            self._logger.warning(
-                "Speech not recognized - audio_length=%d bytes, sample_rate=%d Hz, config=%s",
-                len(audio_bytes),
-                sample_rate_hz,
-                {
-                    "source_lang": config.source_languages or config.default_source_language,
-                    "target_langs": config.target_languages,
-                    "auto_detect": config.auto_detect_source_language,
-                },
-            )
-            raise LiveInterpreterError(
-                "Speech could not be recognized. This may be due to low audio quality, "
-                "background noise, or unsupported language. Please ensure clear audio input."
-            )
-        elif result.reason == speechsdk.ResultReason.Canceled:
-            error_details = cancellation_details or getattr(result.cancellation_details, "error_details", None)
-            cancellation_reason = getattr(result.cancellation_details, "reason", None) if hasattr(result, "cancellation_details") else None
-            self._logger.error(
-                "Translation canceled - reason=%s, error_details=%s",
-                cancellation_reason,
-                error_details,
-            )
-            message = error_details or "Translation request was canceled."
-            raise LiveInterpreterError(message)
+        if error_message:
+            raise LiveInterpreterError(error_message)
 
-        audio_bytes = bytes(synthesized_audio) if synthesized_audio else None
+        audio_data = bytes(synthesized_audio) if synthesized_audio else None
         audio_format = None
         audio_sample_rate = None
-        if audio_bytes and len(audio_bytes) > 44:
-            with io.BytesIO(audio_bytes) as buffer:
+        if audio_data and len(audio_data) > 44:
+            with io.BytesIO(audio_data) as buffer:
                 try:
                     with wave.open(buffer, "rb") as wav_file:
                         audio_format = "wav"
@@ -388,7 +460,7 @@ class LiveInterpreterTranslator:
         return TranslationResult(
             recognized_text=recognized_text or "",
             translations=translations,
-            audio_data=audio_bytes,
+            audio_data=audio_data,
             audio_format=audio_format,
             audio_sample_rate=audio_sample_rate,
             detected_source_language=detected_language,
@@ -420,43 +492,79 @@ class LiveInterpreterTranslator:
 
         for language in config.target_languages:
             translation_config.add_target_language(language)
-        if config.voice_name:
+
+        def _set_property_value(name: str, value: Optional[str], *, aliases: Sequence[str] = ()) -> None:
+            if not value:
+                return
+            candidates = (name, *aliases)
+            last_error: Optional[Exception] = None
+            for candidate in candidates:
+                property_id = getattr(getattr(speechsdk, "PropertyId", None), candidate, None)
+                if property_id is not None:
+                    translation_config.set_property(property_id, value)
+                    return
+                set_property_by_name = getattr(translation_config, "set_property_by_name", None)
+                if callable(set_property_by_name):
+                    try:
+                        set_property_by_name(candidate, value)
+                        return
+                    except Exception as exc:  # pragma: no cover - defensive fallback
+                        last_error = exc
+                        continue
+                try:
+                    translation_config.set_property(candidate, value)
+                    return
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    last_error = exc
+            if last_error is not None:
+                self._logger.warning("Azure SDK missing property support: %s=%s (%s)", name, value, last_error)
+
+        if config.personal_voice:
+            voice_to_use = config.voice_name or config.personal_voice.voice_name
+            if voice_to_use:
+                translation_config.voice_name = voice_to_use
+            _set_property_value("SpeechServiceConnection_SpeakerProfileId", config.personal_voice.speaker_profile_id)
+            _set_property_value("SpeechServiceConnection_SynthesisStyle", config.personal_voice.style)
+            _set_property_value("SpeechServiceConnection_SynthesisLanguage", config.personal_voice.language)
+        elif config.voice_name:
             translation_config.voice_name = config.voice_name
+
+        translation_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_LanguageId,
+            "UND",
+        )
         return translation_config
 
     def _create_auto_detect_config(self, speechsdk, languages: Sequence[str]):
         cleaned = _normalize_languages(languages)
-        if not cleaned:
+        languageconfig = getattr(speechsdk, "languageconfig", None)
+        if languageconfig is None:
+            raise LiveInterpreterError("Installed azure-cognitiveservices-speech SDK does not expose languageconfig.")
+        auto_detect_cls = getattr(languageconfig, "AutoDetectSourceLanguageConfig", None)
+        if auto_detect_cls is None:
             raise LiveInterpreterError(
-                "Auto language detection requires at least one source language. "
-                "Set AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES to a comma-separated list."
+                "Auto language detection is unavailable in this version of azure-cognitiveservices-speech."
             )
-        # Use from_open_range() like the Java sample when no specific languages provided
-        # Or from_languages() when specific languages are provided
-        try:
-            if len(cleaned) == 0:
-                return speechsdk.languageconfig.AutoDetectSourceLanguageConfig.from_open_range()
-            else:
-                return speechsdk.languageconfig.AutoDetectSourceLanguageConfig.from_languages(list(cleaned))
-        except AttributeError:
-            # Fallback for older SDK versions
-            return speechsdk.languageconfig.AutoDetectSourceLanguageConfig(languages=list(cleaned))
 
-    def _write_temp_wav(self, audio_bytes: bytes, sample_rate_hz: int) -> str:
-        if not audio_bytes:
-            raise LiveInterpreterError("Audio data is required for translation.")
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        try:
-            with wave.open(path, "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(sample_rate_hz)
-                wav_file.writeframes(audio_bytes)
-        except Exception:
+        if cleaned:
+            from_languages = getattr(auto_detect_cls, "from_languages", None)
+            if callable(from_languages):
+                return from_languages(list(cleaned))
             try:
-                os.remove(path)
-            except OSError:
-                pass
-            raise
-        return path
+                return auto_detect_cls(languages=list(cleaned))
+            except TypeError as exc:  # pragma: no cover - defensive fallback
+                raise LiveInterpreterError(
+                    "Auto language detection is not supported by the installed Speech SDK."
+                ) from exc
+
+        # No explicit languages provided, fall back to the SDK's open-range detection.
+        try:
+            return auto_detect_cls()
+        except TypeError:
+            from_open_range = getattr(auto_detect_cls, "from_open_range", None)
+            if callable(from_open_range):
+                return from_open_range()
+            raise LiveInterpreterError(
+                "Auto language detection requires specifying AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES "
+                "when the installed Speech SDK does not support open-range detection."
+            )
