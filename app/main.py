@@ -1162,7 +1162,22 @@ async def live_interpreter_websocket(websocket: WebSocket) -> None:
         query_params = parse_qs(query_string)
         
         target_lang = query_params.get("target_lang", ["en"])[0]
-        
+        output_sample_rate_param = query_params.get("output_sample_rate", [None])[0]
+        browser_sample_rate_param = query_params.get("browser_sample_rate", [None])[0]
+
+        requested_output_sample_rate: Optional[int] = None
+        if output_sample_rate_param:
+            try:
+                requested_output_sample_rate = int(output_sample_rate_param)
+            except ValueError:
+                logger.warning("Ignoring invalid output_sample_rate query value: %s", output_sample_rate_param)
+        supported_output_rates = [16000, 24000]
+        if requested_output_sample_rate is not None:
+            requested_output_sample_rate = min(
+                supported_output_rates,
+                key=lambda rate: abs(rate - requested_output_sample_rate),
+            )
+
         # Load base config from environment
         try:
             base_config = load_streaming_config_from_env()
@@ -1176,18 +1191,29 @@ async def live_interpreter_websocket(websocket: WebSocket) -> None:
             return
         
         # Override target language from query param
+        resolved_output_sample_rate = requested_output_sample_rate or base_config.output_sample_rate
+        if resolved_output_sample_rate is not None:
+            resolved_output_sample_rate = min(
+                supported_output_rates,
+                key=lambda rate: abs(rate - resolved_output_sample_rate),
+            )
+
         config = StreamingTranslationConfig(
             subscription_key=base_config.subscription_key,
             region=base_config.region,
             target_language=target_lang,
             voice_name=base_config.voice_name,
             speaker_profile_id=base_config.speaker_profile_id,
-            auto_detect=base_config.auto_detect
+            auto_detect=base_config.auto_detect,
+            output_sample_rate=resolved_output_sample_rate,
         )
         
         logger.info(
-            "Starting Live Interpreter streaming session: session_id=%s, target=%s",
-            session_id, target_lang
+            "Starting Live Interpreter streaming session: session_id=%s, target=%s, browser_rate=%s, synth_rate=%s",
+            session_id,
+            target_lang,
+            browser_sample_rate_param,
+            config.output_sample_rate,
         )
         
         # Create and start session

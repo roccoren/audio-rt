@@ -13,10 +13,13 @@ Based on Azure Speech SDK Live Interpreter functionality.
 
 import asyncio
 import base64
+import io
 import logging
 import os
 import queue
+import re
 import threading
+import wave
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict, Any
 
@@ -32,6 +35,7 @@ class StreamingTranslationConfig:
     voice_name: str = "personal-voice"
     speaker_profile_id: Optional[str] = None
     auto_detect: bool = True
+    output_sample_rate: Optional[int] = None
 
 
 @dataclass
@@ -43,6 +47,7 @@ class TranslationEvent:
     translation: Optional[str] = None
     audio_data: Optional[bytes] = None
     audio_base64: Optional[str] = None
+    audio_sample_rate: Optional[int] = None
     offset: Optional[float] = None
     duration: Optional[float] = None
     error_message: Optional[str] = None
@@ -102,6 +107,13 @@ class LiveInterpreterStreamingSession:
                 self.config.speaker_profile_id
             )
         
+        output_format = self._resolve_output_format(speechsdk)
+        if output_format is not None:
+            try:
+                translation_config.set_speech_synthesis_output_format(output_format)
+            except AttributeError:
+                translation_config.speech_synthesis_output_format = output_format
+
         logger.info(
             "Live Interpreter config: endpoint=%s, target=%s, voice=%s, profile=%s",
             v2_endpoint, self.config.target_language, self.config.voice_name,
@@ -109,6 +121,39 @@ class LiveInterpreterStreamingSession:
         )
         
         return translation_config
+
+    def _resolve_output_format(self, speechsdk):
+        sample_rate = self.config.output_sample_rate
+        if not sample_rate:
+            return None
+
+        enum_cls = getattr(speechsdk, "SpeechSynthesisOutputFormat", None)
+        if enum_cls is None:
+            return None
+
+        candidate_formats = [
+            (48000, "Raw48Khz16BitMonoPcm"),
+            (44100, "Raw44Khz16BitMonoPcm"),
+            (32000, "Raw32Khz16BitMonoPcm"),
+            (24000, "Raw24Khz16BitMonoPcm"),
+            (22050, "Raw22Khz16BitMonoPcm"),
+            (16000, "Raw16Khz16BitMonoPcm"),
+            (8000, "Raw8Khz16BitMonoPcm"),
+        ]
+
+        mapping: dict[int, object] = {}
+        for rate, attr in candidate_formats:
+            value = getattr(enum_cls, attr, None)
+            if value is not None:
+                mapping[rate] = value
+
+        if not mapping:
+            return None
+
+        if sample_rate not in mapping:
+            sample_rate = min(mapping.keys(), key=lambda rate: abs(rate - sample_rate))
+
+        return mapping.get(sample_rate)
     
     def start(self):
         """Start continuous recognition session."""
@@ -296,22 +341,81 @@ class LiveInterpreterStreamingSession:
     def _on_synthesizing(self, evt):
         """Handle synthesized audio from Live Interpreter."""
         if evt.result.audio and len(evt.result.audio) > 0:
-            audio_b64 = base64.b64encode(evt.result.audio).decode('utf-8')
-            
-            logger.info("🔊 Audio synthesized: %d bytes", len(evt.result.audio))
-            
-            # Queue audio event
+            raw_audio = evt.result.audio
+            pcm_bytes = raw_audio
+            sample_rate: Optional[int] = None
+
+            # Attempt to read declared output format (e.g. audio-24khz-16bit-mono-pcm)
+            format_property = None
+            if getattr(evt.result, "properties", None) is not None:
+                try:
+                    speechsdk = self._ensure_speechsdk()
+                    format_property = getattr(speechsdk.PropertyId, "SpeechServiceResponse_AudioOutputFormat", None)
+                except Exception:
+                    format_property = None
+            if format_property is not None:
+                try:
+                    format_value = evt.result.properties.get(format_property, None)  # type: ignore[attr-defined]
+                except Exception:
+                    format_value = None
+                if isinstance(format_value, str):
+                    match = re.search(r"(\d+)\s*k(?:hz|Hz)", format_value)
+                    if match:
+                        try:
+                            sample_rate = int(match.group(1)) * 1000
+                        except ValueError:
+                            sample_rate = None
+
+            # Strip WAV headers when present.
+            if len(raw_audio) >= 12 and raw_audio[:4] == b"RIFF" and raw_audio[8:12] == b"WAVE":
+                try:
+                    with wave.open(io.BytesIO(raw_audio), "rb") as wav_file:
+                        sample_rate = sample_rate or wav_file.getframerate()
+                        pcm_bytes = wav_file.readframes(wav_file.getnframes())
+                except (wave.Error, RuntimeError):
+                    pcm_bytes = raw_audio
+
+            # Infer sample rate via duration metadata when necessary.
+            if sample_rate is None:
+                audio_duration = getattr(evt.result, "audio_duration", None)
+                if audio_duration is None:
+                    audio_duration = getattr(evt.result, "duration", None)
+                if audio_duration:
+                    try:
+                        if hasattr(audio_duration, "total_seconds"):
+                            duration_seconds = audio_duration.total_seconds()
+                        else:
+                            duration_seconds = float(audio_duration) / 10_000_000.0
+                        if duration_seconds and duration_seconds > 0:
+                            total_samples = len(pcm_bytes) / 2.0
+                            sample_rate = int(round(total_samples / duration_seconds))
+                    except Exception:
+                        sample_rate = None
+
+            if sample_rate is None:
+                sample_rate = self.config.output_sample_rate or 16000
+
+            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
+
+            logger.info(
+                "🔊 Audio synthesized: raw=%d bytes, pcm=%d bytes, sample_rate=%s",
+                len(raw_audio),
+                len(pcm_bytes),
+                sample_rate,
+            )
+
             self._audio_queue.put({
-                'type': 'audio',
-                'data': audio_b64,
-                'size': len(evt.result.audio)
+                "type": "audio",
+                "data": audio_b64,
+                "size": len(pcm_bytes),
+                "sampleRate": sample_rate,
             })
-            
-            # Also queue as translation event
+
             self._event_queue.put(TranslationEvent(
                 event_type='audio',
-                audio_data=evt.result.audio,
-                audio_base64=audio_b64
+                audio_data=pcm_bytes,
+                audio_base64=audio_b64,
+                audio_sample_rate=sample_rate,
             ))
     
     def _on_canceled(self, evt):
@@ -359,6 +463,13 @@ def load_streaming_config_from_env() -> StreamingTranslationConfig:
     speaker_profile_id = os.getenv('AZURE_SPEECH_SPEAKER_PROFILE_ID')
     
     auto_detect = os.getenv('AZURE_SPEECH_TRANSLATION_AUTO_DETECT', 'true').lower() in ('true', '1', 'yes')
+
+    output_sample_rate_raw = os.getenv('AZURE_SPEECH_TRANSLATION_OUTPUT_SAMPLE_RATE')
+    try:
+        output_sample_rate = int(output_sample_rate_raw) if output_sample_rate_raw else None
+    except ValueError:
+        logger.warning("Invalid AZURE_SPEECH_TRANSLATION_OUTPUT_SAMPLE_RATE=%s; ignoring.", output_sample_rate_raw)
+        output_sample_rate = None
     
     return StreamingTranslationConfig(
         subscription_key=subscription_key,
@@ -366,5 +477,6 @@ def load_streaming_config_from_env() -> StreamingTranslationConfig:
         target_language=target_language,
         voice_name=voice_name,
         speaker_profile_id=speaker_profile_id,
-        auto_detect=auto_detect
+        auto_detect=auto_detect,
+        output_sample_rate=output_sample_rate,
     )

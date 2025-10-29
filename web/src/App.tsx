@@ -2,6 +2,9 @@ import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const TARGET_SAMPLE_RATE = 24000;
+const LIVE_INTERPRETER_INPUT_SAMPLE_RATE = 16000;
+const LIVE_INTERPRETER_SUPPORTED_OUTPUT_SAMPLE_RATES = [16000, 24000] as const;
+const LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE = 24000;
 
 type ConversationMode = "text" | "voice" | "call";
 type CallTransport = "webrtc" | "websocket";
@@ -203,6 +206,19 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+function closestSupportedOutputSampleRate(rate: number): number {
+  let closest = LIVE_INTERPRETER_SUPPORTED_OUTPUT_SAMPLE_RATES[0];
+  let minDiff = Math.abs(rate - closest);
+  for (const candidate of LIVE_INTERPRETER_SUPPORTED_OUTPUT_SAMPLE_RATES) {
+    const diff = Math.abs(rate - candidate);
+    if (diff < minDiff) {
+      closest = candidate;
+      minDiff = diff;
+    }
+  }
+  return closest;
+}
+
 function pcm16BytesToFloat32(bytes: Uint8Array): Float32Array {
   const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
   const float32 = new Float32Array(int16.length);
@@ -210,6 +226,74 @@ function pcm16BytesToFloat32(bytes: Uint8Array): Float32Array {
     float32[i] = int16[i] / 32767;
   }
   return float32;
+}
+
+function pcm16ToWavArrayBuffer(pcmBytes: Uint8Array, sampleRate: number): ArrayBuffer {
+  const wavBuffer = new ArrayBuffer(44 + pcmBytes.length);
+  const view = new DataView(wavBuffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + pcmBytes.length, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, "data");
+  view.setUint32(40, pcmBytes.length, true);
+
+  new Uint8Array(wavBuffer, 44).set(pcmBytes);
+  return wavBuffer;
+}
+
+async function renderBufferAtContextRate(
+  audioContext: AudioContext,
+  samples: Float32Array,
+  sourceSampleRate: number,
+): Promise<AudioBuffer> {
+  const pcmBytes = new Uint8Array(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    const intSample = Math.round(s < 0 ? s * 0x8000 : s * 0x7fff);
+    pcmBytes[i * 2] = intSample & 0xff;
+    pcmBytes[i * 2 + 1] = (intSample >> 8) & 0xff;
+  }
+
+  const wavBuffer = pcm16ToWavArrayBuffer(pcmBytes, sourceSampleRate);
+  const decoded = await new Promise<AudioBuffer>((resolve, reject) => {
+    const bufferCopy = wavBuffer.slice(0);
+    const onSuccess = (buffer: AudioBuffer) => resolve(buffer);
+    const onError = (error: unknown) =>
+      reject(error instanceof Error ? error : new Error(error !== undefined ? String(error) : "decodeAudioData failed"));
+    const decodeResult = (audioContext.decodeAudioData as unknown as (
+      input: ArrayBuffer,
+      successCallback?: (buffer: AudioBuffer) => void,
+      errorCallback?: (error: Error) => void,
+    ) => void | Promise<AudioBuffer>)(
+      bufferCopy,
+      (result) => onSuccess(result),
+      (error) => onError(error),
+    );
+    if (decodeResult instanceof Promise) {
+      decodeResult.then(onSuccess, onError);
+    }
+  });
+  return decoded;
 }
 
 function calculateRms(samples: Float32Array): number {
@@ -445,6 +529,9 @@ export default function App(): JSX.Element {
   const liveInterpreterSequenceRef = useRef(0);
   const liveInterpreterWsRef = useRef<WebSocket | null>(null);
   const liveInterpreterProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveInterpreterActivePlaybackCountRef = useRef(0);
+  const liveInterpreterPlaybackGateUntilRef = useRef(0);
+  const liveInterpreterOutputSampleRateRef = useRef<number>(LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE);
 
   const awaitIceGatheringComplete = useCallback(
     (peer: RTCPeerConnection) =>
@@ -560,6 +647,9 @@ export default function App(): JSX.Element {
     liveInterpreterPendingChunksRef.current = [];
     liveInterpreterSendingRef.current = false;
     liveInterpreterSequenceRef.current = 0;
+    liveInterpreterActivePlaybackCountRef.current = 0;
+    liveInterpreterPlaybackGateUntilRef.current = 0;
+    liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
     setCallTranscripts({});
   }, []);
 
@@ -619,6 +709,9 @@ export default function App(): JSX.Element {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.src = "";
     }
+    liveInterpreterActivePlaybackCountRef.current = 0;
+    liveInterpreterPlaybackGateUntilRef.current = 0;
+    liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
   }, []);
 
   const stopWebsocketCall = useCallback(() => {
@@ -655,6 +748,9 @@ export default function App(): JSX.Element {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.src = "";
     }
+    liveInterpreterActivePlaybackCountRef.current = 0;
+    liveInterpreterPlaybackGateUntilRef.current = 0;
+    liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
   }, []);
 
   const sendLiveInterpreterRequest = useCallback(async () => {
@@ -843,14 +939,19 @@ export default function App(): JSX.Element {
 
       let createdAudioContext: AudioContext | null = null;
       try {
-        createdAudioContext = new AudioContext({ sampleRate: 16000 });
+        createdAudioContext = new AudioContext();
       } catch (audioContextError) {
-        console.warn("Falling back to default AudioContext sample rate.", audioContextError);
+        console.warn("Failed to create AudioContext at device rate, retrying with default.", audioContextError);
         createdAudioContext = new AudioContext();
       }
       const audioContext = createdAudioContext;
       callAudioContextRef.current = audioContext;
       callPlaybackTimeRef.current = audioContext.currentTime;
+      liveInterpreterActivePlaybackCountRef.current = 0;
+      liveInterpreterPlaybackGateUntilRef.current = audioContext.currentTime;
+      const playbackSampleRate = audioContext.sampleRate || LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
+      const desiredAzureOutputRate = closestSupportedOutputSampleRate(playbackSampleRate);
+      liveInterpreterOutputSampleRateRef.current = desiredAzureOutputRate;
 
       try {
         await audioContext.resume();
@@ -887,7 +988,12 @@ export default function App(): JSX.Element {
       
       const apiUrl = new URL(API_BASE_URL);
       const wsProtocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${wsProtocol}//${apiUrl.host}/api/live-interpreter/ws?target_lang=${targetLang}`;
+      const wsParams = new URLSearchParams({
+        target_lang: targetLang,
+        output_sample_rate: String(desiredAzureOutputRate),
+        browser_sample_rate: String(Math.round(playbackSampleRate)),
+      });
+      const wsUrl = `${wsProtocol}//${apiUrl.host}/api/live-interpreter/ws?${wsParams.toString()}`;
       
       console.log("Connecting to Live Interpreter WebSocket:", wsUrl);
       const ws = new WebSocket(wsUrl);
@@ -946,16 +1052,43 @@ export default function App(): JSX.Element {
               try {
                 const audioBytes = base64ToUint8Array(audioB64);
                 const float32 = pcm16BytesToFloat32(audioBytes);
-                
+
                 if (float32.length) {
-                  const buffer = audioContext.createBuffer(1, float32.length, 16000);
-                  buffer.copyToChannel(Float32Array.from(float32), 0);
+                  if (typeof data.audioSampleRate === "number" && data.audioSampleRate > 0) {
+                    liveInterpreterOutputSampleRateRef.current = data.audioSampleRate;
+                  }
+                  const sourceSampleRate =
+                    typeof data.audioSampleRate === "number" && data.audioSampleRate > 0
+                      ? data.audioSampleRate
+                      : liveInterpreterOutputSampleRateRef.current;
+                  const buffer = await renderBufferAtContextRate(audioContext, float32, sourceSampleRate);
+                  console.debug("Live Interpreter chunk", {
+                    reportedSampleRate: sourceSampleRate,
+                    bufferSampleRate: buffer.sampleRate,
+                    durationSec: Number(buffer.duration.toFixed(3)),
+                    frameCount: buffer.length,
+                  });
+                  liveInterpreterOutputSampleRateRef.current = buffer.sampleRate;
                   const bufferSource = audioContext.createBufferSource();
                   bufferSource.buffer = buffer;
                   bufferSource.connect(destination);
                   const startAt = Math.max(callPlaybackTimeRef.current, audioContext.currentTime);
                   bufferSource.start(startAt);
                   callPlaybackTimeRef.current = startAt + buffer.duration;
+                  liveInterpreterActivePlaybackCountRef.current += 1;
+                  const gateUntil = startAt + buffer.duration + 0.2;
+                  if (gateUntil > liveInterpreterPlaybackGateUntilRef.current) {
+                    liveInterpreterPlaybackGateUntilRef.current = gateUntil;
+                  }
+                  bufferSource.onended = () => {
+                    liveInterpreterActivePlaybackCountRef.current = Math.max(
+                      0,
+                      liveInterpreterActivePlaybackCountRef.current - 1,
+                    );
+                    if (audioContext.currentTime >= liveInterpreterPlaybackGateUntilRef.current) {
+                      liveInterpreterPlaybackGateUntilRef.current = audioContext.currentTime;
+                    }
+                  };
                 }
               } catch (audioError) {
                 console.error("Error playing audio:", audioError);
@@ -995,6 +1128,13 @@ export default function App(): JSX.Element {
           return;
         }
 
+        if (
+          liveInterpreterActivePlaybackCountRef.current > 0 ||
+          audioContext.currentTime < liveInterpreterPlaybackGateUntilRef.current
+        ) {
+          return;
+        }
+
         const { inputBuffer } = audioEvent;
         const frameLength = inputBuffer.length;
         if (!frameLength) {
@@ -1014,7 +1154,7 @@ export default function App(): JSX.Element {
           }
         }
 
-        const resampled = resample(mixed, audioContext.sampleRate, 16000);
+        const resampled = resample(mixed, audioContext.sampleRate, LIVE_INTERPRETER_INPUT_SAMPLE_RATE);
         if (!resampled.length) {
           return;
         }
