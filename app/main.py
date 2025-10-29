@@ -20,11 +20,15 @@ load_dotenv()
 from azure.ai.voicelive.aio import connect as voicelive_connect
 from azure.ai.voicelive.models import (
     AzureStandardVoice,
+    FunctionTool,
+    FunctionCallOutputItem,
     InputAudioFormat,
     Modality,
     OutputAudioFormat,
     RequestSession,
+    ResponseCreateParams,
     ServerVad,
+    ServerEventResponseFunctionCallArgumentsDone,
 )
 from azure.core.credentials import AzureKeyCredential
 
@@ -46,6 +50,7 @@ from src.live_interpreter_streaming import (
     StreamingTranslationConfig,
     load_streaming_config_from_env,
 )
+from src.weather_lookup import WeatherLookupError, lookup_current_weather
 
 
 app = FastAPI(title="Zara Voice Service")
@@ -500,6 +505,27 @@ async def _create_voicelive_session(payload: RealtimeSessionRequest) -> Realtime
 
 
 DEFAULT_AZURE_VOICE = "en-US-Ava:DragonHDLatestNeural"
+WEATHER_TOOL_NAME = "get_current_weather"
+WEATHER_LOOKUP_TOOL = FunctionTool(
+    name=WEATHER_TOOL_NAME,
+    description="Look up the current weather conditions for a specific location using WeatherAPI.com.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "location": {
+                "type": "string",
+                "description": "City name, ZIP/postal code, IP address, or latitude/longitude query supported by WeatherAPI.com.",
+            },
+            "lang": {
+                "type": "string",
+                "description": "Optional WeatherAPI language code (e.g. 'en', 'fr').",
+            },
+        },
+        "required": ["location"],
+        "additionalProperties": False,
+    },
+)
+VOICELIVE_TOOLS: list[FunctionTool] = [WEATHER_LOOKUP_TOOL]
 
 
 def _resolve_voicelive_voice(voice: Optional[str]) -> Union[AzureStandardVoice, str]:
@@ -514,14 +540,109 @@ def _resolve_voicelive_voice(voice: Optional[str]) -> Union[AzureStandardVoice, 
 
 def _build_voicelive_session_config(instructions: str, voice: Optional[str]) -> RequestSession:
     resolved_instructions = (instructions or ZARA_INSTRUCTIONS).strip() or ZARA_INSTRUCTIONS
+    tools = list(VOICELIVE_TOOLS)
     return RequestSession(
         modalities=[Modality.TEXT, Modality.AUDIO],
         instructions=resolved_instructions,
         voice=_resolve_voicelive_voice(voice),
         input_audio_format=InputAudioFormat.PCM16,
         output_audio_format=OutputAudioFormat.PCM16,
+        tools=tools or None,
+        tool_choice="auto",
         turn_detection=ServerVad(threshold=0.5, prefix_padding_ms=300, silence_duration_ms=500),
     )
+
+
+def _build_weather_tool_payload(observation) -> dict[str, object]:
+    """Convert a WeatherObservation into a JSON-serializable tool payload."""
+    return {
+        "success": True,
+        "summary": observation.summary(),
+        "location": {
+            "name": observation.location_name,
+            "region": observation.region,
+            "country": observation.country,
+            "local_time": observation.local_time,
+        },
+        "current": {
+            "condition": observation.condition_text,
+            "temperature_c": observation.temperature_c,
+            "temperature_f": observation.temperature_f,
+            "feelslike_c": observation.feelslike_c,
+            "feelslike_f": observation.feelslike_f,
+            "humidity": observation.humidity,
+            "wind_kph": observation.wind_kph,
+            "wind_mph": observation.wind_mph,
+        },
+        "source": "weatherapi.com",
+    }
+
+
+async def _handle_voicelive_function_call(
+    connection,
+    *,
+    event: ServerEventResponseFunctionCallArgumentsDone,
+    logger: logging.Logger,
+    default_voice: Optional[Union[str, AzureStandardVoice]],
+) -> bool:
+    """Handle VoiceLive function call completions. Returns True when handled."""
+    function_name = (event.name or "").strip()
+    if function_name != WEATHER_TOOL_NAME:
+        return False
+
+    try:
+        arguments = json.loads(event.arguments or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning("Weather tool received invalid JSON arguments: %s", exc)
+        arguments = {}
+
+    location = (arguments.get("location") or arguments.get("q") or "").strip()
+    lang_value = arguments.get("lang")
+    lang = lang_value.strip() if isinstance(lang_value, str) else None
+
+    if not location:
+        result_payload = {"success": False, "error": "The weather tool requires a 'location' argument."}
+    else:
+        try:
+            observation = await lookup_current_weather(location, lang=lang)
+            result_payload = _build_weather_tool_payload(observation)
+        except WeatherLookupError as exc:
+            result_payload = {"success": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Unexpected error during weather lookup: %s", exc)
+            result_payload = {"success": False, "error": "Unexpected weather lookup failure."}
+
+    output_text = json.dumps(result_payload, ensure_ascii=False)
+
+    function_output = FunctionCallOutputItem(
+        call_id=event.call_id,
+        output=output_text,
+        status="completed" if result_payload.get("success") else "incomplete",
+    )
+
+    try:
+        await connection.conversation.item.create(item=function_output)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to send weather tool output: %s", exc)
+        return True
+
+    response_voice: Optional[Union[str, AzureStandardVoice]] = None
+    if default_voice:
+        if isinstance(default_voice, AzureStandardVoice):
+            response_voice = default_voice
+        else:
+            response_voice = _resolve_voicelive_voice(default_voice)
+
+    response_params = ResponseCreateParams(
+        modalities=[Modality.TEXT, Modality.AUDIO],
+        voice=response_voice,
+    )
+
+    try:
+        await connection.response.create(response=response_params)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to trigger follow-up response after weather tool output: %s", exc)
+    return True
 
 
 def _sanitize_voicelive_payload(value: object) -> object:
@@ -586,12 +707,15 @@ async def _dispatch_voicelive_message(
             voice_obj = default_voice
         else:
             voice_obj = _resolve_voicelive_voice(default_voice)
+        tools = list(VOICELIVE_TOOLS)
         session_update = RequestSession(
             modalities=_ensure_modality_list(modalities),
             instructions=instructions,
             voice=voice_obj,
             input_audio_format=InputAudioFormat.PCM16,
             output_audio_format=OutputAudioFormat.PCM16,
+            tools=tools or None,
+            tool_choice="auto",
             turn_detection=turn_detection or ServerVad(threshold=0.5, prefix_padding_ms=300, silence_duration_ms=500),
         )
         await connection.session.update(session=session_update)
@@ -694,12 +818,29 @@ async def voicelive_bridge(websocket: WebSocket) -> None:
         ) as connection:
             session_created = asyncio.Event()
             session_error: dict[str, object] = {}
+            session_voice_ref: Optional[Union[str, AzureStandardVoice]] = None
 
             async def forward_events():
                 try:
                     async for event in connection:
                         if not session_created.is_set() and event.type == "session.created":
                             session_created.set()
+                        if isinstance(event, ServerEventResponseFunctionCallArgumentsDone):
+                            try:
+                                handled = await _handle_voicelive_function_call(
+                                    connection,
+                                    event=event,
+                                    logger=logger,
+                                    default_voice=session_voice_ref,
+                                )
+                                if handled:
+                                    logger.debug(
+                                        "Handled VoiceLive function call '%s' (call_id=%s).",
+                                        event.name,
+                                        event.call_id,
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.exception("VoiceLive function handler failed: %s", exc)
                         payload = _sanitize_voicelive_payload(event.as_dict())
                         await websocket.send_json(payload)
                 except WebSocketDisconnect:
@@ -727,6 +868,7 @@ async def voicelive_bridge(websocket: WebSocket) -> None:
                 raise session_error.get("exception") or RuntimeError("VoiceLive session failed to establish.")
 
             session_voice = _resolve_voicelive_voice(config.voice if isinstance(config.voice, str) else None)
+            session_voice_ref = session_voice
 
             consume_task = asyncio.create_task(
                 _consume_voicelive_messages(connection, websocket, logger, default_voice=session_voice)

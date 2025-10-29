@@ -66,6 +66,18 @@ Create the web env file (update the URL if the backend runs elsewhere):
 cp .env.template .env
 ```
 
+### Weather Lookup Helper (Optional)
+
+To enable the async `lookup_current_weather` helper in `src/weather_lookup.py`, supply a WeatherAPI.com key:
+
+```bash
+export WEATHER_API_KEY="your-weatherapi-key"
+```
+
+Optional settings include `WEATHER_API_BASE_URL`, `WEATHER_API_TIMEOUT` (seconds), and `WEATHER_API_LANG` for localized condition text. The helper follows the official WeatherAPI.com Swagger definition for the `/current.json` endpoint.
+
+When this key is present, the VoiceLive bridge advertises a `get_current_weather` tool so the assistant can call WeatherAPI.com and summarize live conditions during a session.
+
 ## Backend: Zara Voice API
 
 Start the FastAPI server (it exposes `/api/respond`, `/api/realtime/session`, and `/api/realtime/handshake` as a thin proxy to Azure OpenAI):
