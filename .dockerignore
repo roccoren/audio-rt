@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.venv
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+node_modules/
+web/node_modules/
+web/dist/
+output_sdk.wav
+customvoice/
+cognitive-services-speech-sdk/

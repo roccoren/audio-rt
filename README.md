@@ -182,3 +182,174 @@ The same speaker profile settings also enable Personal Voice synthesis for Azure
 - The persona instructions in `src/voice_client.py` follow the specification supplied in the task description.
 - Network access is required to run the demo against Azure OpenAI; the SDK is not bundled here.
 - Browser recording relies on the MediaRecorder API (Chrome, Edge, and Firefox desktop all support it).
+
+## Deployment: Azure Container Apps
+
+You can deploy both the FastAPI backend and the Vite/React frontend to [Azure Container Apps](https://learn.microsoft.com/azure/container-apps/overview). The workflow below assumes you have the Azure CLI installed (v2.53+), the `containerapp` extension added, and you are already logged in (`az login`).
+
+```bash
+az extension add --name containerapp
+```
+
+1. **Set environment variables** (adjust the names, location, and image tags as needed):
+
+   ```bash
+   export RESOURCE_GROUP=voice-group
+   export LOCATION=southeastasia
+   export ACR_NAME=ankeraiprecr
+   export CONTAINERAPPS_ENV=zara-voice-env
+   export BACKEND_APP=zara-voice-api
+   export FRONTEND_APP=zara-voice-web
+   export IMAGE_TAG=v1.0
+   ```
+
+   > Tip: run `az account list-locations -o table` if you need to pick a different region.
+
+2. **Provision Azure resources** (resource group, container registry, and a Container Apps environment):
+
+   ```bash
+   az group create --name $RESOURCE_GROUP --location $LOCATION
+   az acr create --name $ACR_NAME --resource-group $RESOURCE_GROUP --sku Basic
+   ACR_LOGIN_SERVER=$(az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP --query loginServer -o tsv)
+   az containerapp env create --name $CONTAINERAPPS_ENV --resource-group $RESOURCE_GROUP --location $LOCATION
+   ```
+
+3. **Build and push the backend image** (uses the `Dockerfile` at the repository root):
+
+   ```bash
+   az acr build \
+     --registry $ACR_NAME \
+     --image zara-backend:$IMAGE_TAG \
+     -f Dockerfile \
+     .
+   BACKEND_IMAGE="$ACR_LOGIN_SERVER/zara-backend:$IMAGE_TAG"
+   ```
+
+4. **Create the backend container app**. First load your Azure secrets into variables (never commit them):
+
+   ```bash
+   export AZURE_OPENAI_ENDPOINT="https://<your-azure-openai-resource>.openai.azure.com"
+   export AZURE_OPENAI_API_KEY="<azure-openai-api-key>"
+   export AZURE_OPENAI_DEPLOYMENT="gpt-realtime-mini"
+   export AZURE_OPENAI_REALTIME_HOST="https://<region>.realtimeapi-preview.ai.azure.com"
+   export AZURE_OPENAI_VOICE="alloy"
+   export AZURE_OPENAI_SAMPLE_RATE="24000"
+   export AZURE_OPENAI_API_VERSION="2025-04-01-preview"
+   export AZURE_VOICELIVE_ENDPOINT="https://<your-voicelive-resource>.cognitiveservices.azure.com"
+   export AZURE_VOICELIVE_MODEL="gpt-4.1"
+   export AZURE_VOICELIVE_API_VERSION="2025-10-01"
+   export AZURE_VOICELIVE_API_KEY="<azure-voicelive-key>"
+   export AZURE_SPEECH_TRANSLATION_KEY="<azure-speech-translation-key>"
+   export AZURE_SPEECH_TRANSLATION_REGION="southeastasia"
+   export AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES="zh-CN"
+   export AZURE_SPEECH_TRANSLATION_TARGET_LANGUAGE="en"
+   export AZURE_SPEECH_TRANSLATION_VOICE="personal-voice"
+   export AZURE_SPEECH_TRANSLATION_AUTO_DETECT="true"
+   ```
+
+   Create (or update) the backend container app, providing the registry credentials, secrets, and environment variable bindings in one step:
+
+   ```bash
+   az containerapp create \
+     --name $BACKEND_APP \
+     --resource-group $RESOURCE_GROUP \
+     --environment $CONTAINERAPPS_ENV \
+     --image $BACKEND_IMAGE \
+     --target-port 8000 \
+     --ingress external \
+     --min-replicas 1 \
+     --max-replicas 1 \
+     --registry-server $ACR_LOGIN_SERVER \
+     --registry-username $(az acr credential show --name $ACR_NAME --query username -o tsv) \
+     --registry-password $(az acr credential show --name $ACR_NAME --query passwords[0].value -o tsv) \
+     --secrets \
+       azure-openai-endpoint=$AZURE_OPENAI_ENDPOINT \
+       azure-openai-api-key=$AZURE_OPENAI_API_KEY \
+       azure-openai-deployment=$AZURE_OPENAI_DEPLOYMENT \
+       azure-openai-realtime-host=$AZURE_OPENAI_REALTIME_HOST \
+       azure-openai-voice=$AZURE_OPENAI_VOICE \
+       azure-openai-sample-rate=$AZURE_OPENAI_SAMPLE_RATE \
+       azure-openai-api-version=$AZURE_OPENAI_API_VERSION \
+       azure-voicelive-endpoint=$AZURE_VOICELIVE_ENDPOINT \
+       azure-voicelive-model=$AZURE_VOICELIVE_MODEL \
+       azure-voicelive-api-version=$AZURE_VOICELIVE_API_VERSION \
+       azure-voicelive-api-key=$AZURE_VOICELIVE_API_KEY \
+       azure-speech-translation-key=$AZURE_SPEECH_TRANSLATION_KEY \
+       azure-speech-translation-region=$AZURE_SPEECH_TRANSLATION_REGION \
+       azure-speech-translation-source-languages=$AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES \
+       azure-speech-translation-target-language=$AZURE_SPEECH_TRANSLATION_TARGET_LANGUAGE \
+       azure-speech-translation-voice=$AZURE_SPEECH_TRANSLATION_VOICE \
+       azure-speech-translation-auto-detect=$AZURE_SPEECH_TRANSLATION_AUTO_DETECT \
+     --env-vars \
+       AZURE_OPENAI_ENDPOINT=secretref:azure-openai-endpoint \
+       AZURE_OPENAI_API_KEY=secretref:azure-openai-api-key \
+       AZURE_OPENAI_DEPLOYMENT=secretref:azure-openai-deployment \
+       AZURE_OPENAI_REALTIME_HOST=secretref:azure-openai-realtime-host \
+       AZURE_OPENAI_VOICE=secretref:azure-openai-voice \
+       AZURE_OPENAI_SAMPLE_RATE=secretref:azure-openai-sample-rate \
+       AZURE_OPENAI_API_VERSION=secretref:azure-openai-api-version \
+       AZURE_VOICELIVE_ENDPOINT=secretref:azure-voicelive-endpoint \
+       AZURE_VOICELIVE_MODEL=secretref:azure-voicelive-model \
+       AZURE_VOICELIVE_API_VERSION=secretref:azure-voicelive-api-version \
+       AZURE_VOICELIVE_API_KEY=secretref:azure-voicelive-api-key \
+       AZURE_SPEECH_TRANSLATION_KEY=secretref:azure-speech-translation-key \
+       AZURE_SPEECH_TRANSLATION_REGION=secretref:azure-speech-translation-region \
+       AZURE_SPEECH_TRANSLATION_SOURCE_LANGUAGES=secretref:azure-speech-translation-source-languages \
+       AZURE_SPEECH_TRANSLATION_TARGET_LANGUAGE=secretref:azure-speech-translation-target-language \
+       AZURE_SPEECH_TRANSLATION_VOICE=secretref:azure-speech-translation-voice \
+       AZURE_SPEECH_TRANSLATION_AUTO_DETECT=secretref:azure-speech-translation-auto-detect
+   ```
+
+   When the command finishes, capture the public Fully Qualified Domain Name (FQDN):
+
+   ```bash
+   BACKEND_FQDN=$(az containerapp show --name $BACKEND_APP --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv)
+   echo "Backend reachable at: https://$BACKEND_FQDN"
+   ```
+
+5. **Build and push the frontend image** once the backend endpoint is known. The Vite build embeds the backend URL, so pass it as a build argument:
+
+   ```bash
+   az acr build \
+     --registry $ACR_NAME \
+     --image zara-frontend:$IMAGE_TAG \
+     --file web/Dockerfile \
+     --build-arg VITE_API_BASE_URL="https://$BACKEND_FQDN" \
+     .
+   FRONTEND_IMAGE="$ACR_LOGIN_SERVER/zara-frontend:$IMAGE_TAG"
+   ```
+
+6. **Create the frontend container app** (static content served by Nginx):
+
+   ```bash
+   az containerapp create \
+     --name $FRONTEND_APP \
+     --resource-group $RESOURCE_GROUP \
+     --environment $CONTAINERAPPS_ENV \
+     --image $FRONTEND_IMAGE \
+     --ingress external \
+     --target-port 80 \
+     --min-replicas 1 \
+     --max-replicas 1 \
+     --registry-server $ACR_LOGIN_SERVER \
+     --registry-username $(az acr credential show --name $ACR_NAME --query username -o tsv) \
+     --registry-password $(az acr credential show --name $ACR_NAME --query passwords[0].value -o tsv)
+   ```
+
+   Retrieve the frontend FQDN:
+
+   ```bash
+   az containerapp show --name $FRONTEND_APP --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv
+   ```
+
+7. **Future updates** just require a new image tag and a `az containerapp update` for the affected service:
+
+   ```bash
+   export IMAGE_TAG=v0.1.1
+   az acr build --registry $ACR_NAME --image zara-backend:$IMAGE_TAG -f Dockerfile .
+   az containerapp update --name $BACKEND_APP --resource-group $RESOURCE_GROUP --image "$ACR_LOGIN_SERVER/zara-backend:$IMAGE_TAG"
+   ```
+
+   Repeat the same pattern for the frontend (remember to pass the backend URL build argument when rebuilding the web image).
+
+For production setups consider using managed identities for ACR pulls, locking down the backend ingress to internal traffic only, and fronting the container apps with Azure Front Door or Application Gateway for TLS and WAF management.
