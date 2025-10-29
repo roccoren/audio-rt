@@ -1253,6 +1253,7 @@ async def live_interpreter_websocket(websocket: WebSocket) -> None:
                         "originalText": event.original_text,
                         "translation": event.translation,
                         "audioBase64": event.audio_base64,
+                        "audioSampleRate": event.audio_sample_rate,
                         "offset": event.offset,
                         "duration": event.duration,
                         "errorMessage": event.error_message,

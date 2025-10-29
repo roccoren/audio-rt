@@ -6,6 +6,8 @@ const LIVE_INTERPRETER_INPUT_SAMPLE_RATE = 16000;
 const LIVE_INTERPRETER_SUPPORTED_OUTPUT_SAMPLE_RATES = [16000, 24000] as const;
 const LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE = 24000;
 
+const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
 type ConversationMode = "text" | "voice" | "call";
 type CallTransport = "webrtc" | "websocket";
 type CallProvider = "gpt-realtime" | "voicelive" | "live-interpreter";
@@ -226,74 +228,6 @@ function pcm16BytesToFloat32(bytes: Uint8Array): Float32Array {
     float32[i] = int16[i] / 32767;
   }
   return float32;
-}
-
-function pcm16ToWavArrayBuffer(pcmBytes: Uint8Array, sampleRate: number): ArrayBuffer {
-  const wavBuffer = new ArrayBuffer(44 + pcmBytes.length);
-  const view = new DataView(wavBuffer);
-
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  };
-
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-  const blockAlign = numChannels * (bitsPerSample / 8);
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + pcmBytes.length, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-  writeString(36, "data");
-  view.setUint32(40, pcmBytes.length, true);
-
-  new Uint8Array(wavBuffer, 44).set(pcmBytes);
-  return wavBuffer;
-}
-
-async function renderBufferAtContextRate(
-  audioContext: AudioContext,
-  samples: Float32Array,
-  sourceSampleRate: number,
-): Promise<AudioBuffer> {
-  const pcmBytes = new Uint8Array(samples.length * 2);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    const intSample = Math.round(s < 0 ? s * 0x8000 : s * 0x7fff);
-    pcmBytes[i * 2] = intSample & 0xff;
-    pcmBytes[i * 2 + 1] = (intSample >> 8) & 0xff;
-  }
-
-  const wavBuffer = pcm16ToWavArrayBuffer(pcmBytes, sourceSampleRate);
-  const decoded = await new Promise<AudioBuffer>((resolve, reject) => {
-    const bufferCopy = wavBuffer.slice(0);
-    const onSuccess = (buffer: AudioBuffer) => resolve(buffer);
-    const onError = (error: unknown) =>
-      reject(error instanceof Error ? error : new Error(error !== undefined ? String(error) : "decodeAudioData failed"));
-    const decodeResult = (audioContext.decodeAudioData as unknown as (
-      input: ArrayBuffer,
-      successCallback?: (buffer: AudioBuffer) => void,
-      errorCallback?: (error: Error) => void,
-    ) => void | Promise<AudioBuffer>)(
-      bufferCopy,
-      (result) => onSuccess(result),
-      (error) => onError(error),
-    );
-    if (decodeResult instanceof Promise) {
-      decodeResult.then(onSuccess, onError);
-    }
-  });
-  return decoded;
 }
 
 function calculateRms(samples: Float32Array): number {
@@ -520,7 +454,7 @@ export default function App(): JSX.Element {
   const callDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const callPlaybackTimeRef = useRef<number>(0);
   const callStreamingStateRef = useRef<"idle" | "speaking" | "awaiting_response">("idle");
-  const callLastVoiceActivityRef = useRef<number>(performance.now());
+  const callLastVoiceActivityRef = useRef<number>(nowMs());
   const callAwaitingResponseRef = useRef(false);
   const callHasSpeechSinceCommitRef = useRef(false);
   const callResponseStateRef = useRef<Map<string, RealtimeResponseState>>(new Map());
@@ -529,8 +463,9 @@ export default function App(): JSX.Element {
   const liveInterpreterSequenceRef = useRef(0);
   const liveInterpreterWsRef = useRef<WebSocket | null>(null);
   const liveInterpreterProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const liveInterpreterActivePlaybackCountRef = useRef(0);
-  const liveInterpreterPlaybackGateUntilRef = useRef(0);
+  const liveInterpreterPlaybackQueueRef = useRef<string[]>([]);
+  const liveInterpreterCurrentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const liveInterpreterBlockMicUntilRef = useRef<number>(0);
   const liveInterpreterOutputSampleRateRef = useRef<number>(LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE);
 
   const awaitIceGatheringComplete = useCallback(
@@ -647,8 +582,14 @@ export default function App(): JSX.Element {
     liveInterpreterPendingChunksRef.current = [];
     liveInterpreterSendingRef.current = false;
     liveInterpreterSequenceRef.current = 0;
-    liveInterpreterActivePlaybackCountRef.current = 0;
-    liveInterpreterPlaybackGateUntilRef.current = 0;
+    liveInterpreterPlaybackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    liveInterpreterPlaybackQueueRef.current = [];
+    if (liveInterpreterCurrentAudioRef.current) {
+      liveInterpreterCurrentAudioRef.current.pause();
+      liveInterpreterCurrentAudioRef.current.src = "";
+      liveInterpreterCurrentAudioRef.current = null;
+    }
+    liveInterpreterBlockMicUntilRef.current = nowMs();
     liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
     setCallTranscripts({});
   }, []);
@@ -691,6 +632,68 @@ export default function App(): JSX.Element {
     [ensureRealtimeResponseState],
   );
 
+  const processLiveInterpreterPlayback = useCallback(() => {
+    if (liveInterpreterCurrentAudioRef.current) {
+      return;
+    }
+    const nextUrl = liveInterpreterPlaybackQueueRef.current.shift();
+    if (!nextUrl) {
+      return;
+    }
+
+    const audioElement = new Audio(nextUrl);
+    liveInterpreterCurrentAudioRef.current = audioElement;
+
+    const cleanup = () => {
+      audioElement.removeEventListener("ended", cleanup);
+      audioElement.removeEventListener("error", cleanup);
+      audioElement.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      audioElement.removeEventListener("loadeddata", handleLoadedMetadata);
+      liveInterpreterCurrentAudioRef.current = null;
+      URL.revokeObjectURL(nextUrl);
+      processLiveInterpreterPlayback();
+    };
+
+    const handleLoadedMetadata = () => {
+      const duration = audioElement.duration;
+      if (!Number.isNaN(duration) && duration > 0) {
+        const releaseAt = nowMs() + duration * 1000 + 200;
+        if (releaseAt > liveInterpreterBlockMicUntilRef.current) {
+          liveInterpreterBlockMicUntilRef.current = releaseAt;
+        }
+      }
+    };
+
+    audioElement.addEventListener("ended", cleanup);
+    audioElement.addEventListener("error", cleanup);
+    audioElement.addEventListener("loadedmetadata", handleLoadedMetadata);
+    audioElement.addEventListener("loadeddata", handleLoadedMetadata);
+
+    const playPromise = audioElement.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch(() => {
+        cleanup();
+      });
+    }
+  }, []);
+
+  const enqueueLiveInterpreterAudio = useCallback(
+    (blob: Blob, sampleRate: number) => {
+      const url = URL.createObjectURL(blob);
+      liveInterpreterPlaybackQueueRef.current.push(url);
+      const approxBytes = Math.max(0, blob.size - 44);
+      if (sampleRate > 0) {
+        const approxDurationMs = (approxBytes / (sampleRate * 2)) * 1000;
+        const releaseAt = nowMs() + approxDurationMs + 200;
+        if (releaseAt > liveInterpreterBlockMicUntilRef.current) {
+          liveInterpreterBlockMicUntilRef.current = releaseAt;
+        }
+      }
+      processLiveInterpreterPlayback();
+    },
+    [processLiveInterpreterPlayback],
+  );
+
   const stopWebrtcCall = useCallback(() => {
     const peer = callPeerRef.current;
     if (peer) {
@@ -709,8 +712,14 @@ export default function App(): JSX.Element {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.src = "";
     }
-    liveInterpreterActivePlaybackCountRef.current = 0;
-    liveInterpreterPlaybackGateUntilRef.current = 0;
+    liveInterpreterPlaybackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    liveInterpreterPlaybackQueueRef.current = [];
+    if (liveInterpreterCurrentAudioRef.current) {
+      liveInterpreterCurrentAudioRef.current.pause();
+      liveInterpreterCurrentAudioRef.current.src = "";
+      liveInterpreterCurrentAudioRef.current = null;
+    }
+    liveInterpreterBlockMicUntilRef.current = nowMs();
     liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
   }, []);
 
@@ -748,8 +757,14 @@ export default function App(): JSX.Element {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.src = "";
     }
-    liveInterpreterActivePlaybackCountRef.current = 0;
-    liveInterpreterPlaybackGateUntilRef.current = 0;
+    liveInterpreterPlaybackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    liveInterpreterPlaybackQueueRef.current = [];
+    if (liveInterpreterCurrentAudioRef.current) {
+      liveInterpreterCurrentAudioRef.current.pause();
+      liveInterpreterCurrentAudioRef.current.src = "";
+      liveInterpreterCurrentAudioRef.current = null;
+    }
+    liveInterpreterBlockMicUntilRef.current = nowMs();
     liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
   }, []);
 
@@ -882,7 +897,7 @@ export default function App(): JSX.Element {
       callAwaitingResponseRef.current = false;
       callStreamingStateRef.current = "idle";
       callHasSpeechSinceCommitRef.current = false;
-      callLastVoiceActivityRef.current = performance.now();
+      callLastVoiceActivityRef.current = nowMs();
       liveInterpreterSendingRef.current = false;
     }
   }, [callProvider, liveInterpreterTargets, setCallTranscripts, setError, setHistory]);
@@ -922,6 +937,15 @@ export default function App(): JSX.Element {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.src = "";
     }
+    liveInterpreterPlaybackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    liveInterpreterPlaybackQueueRef.current = [];
+    if (liveInterpreterCurrentAudioRef.current) {
+      liveInterpreterCurrentAudioRef.current.pause();
+      liveInterpreterCurrentAudioRef.current.src = "";
+      liveInterpreterCurrentAudioRef.current = null;
+    }
+    liveInterpreterBlockMicUntilRef.current = nowMs();
+    liveInterpreterOutputSampleRateRef.current = LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
   }, []);
 
   const startLiveInterpreterCall = useCallback(async () => {
@@ -947,8 +971,13 @@ export default function App(): JSX.Element {
       const audioContext = createdAudioContext;
       callAudioContextRef.current = audioContext;
       callPlaybackTimeRef.current = audioContext.currentTime;
-      liveInterpreterActivePlaybackCountRef.current = 0;
-      liveInterpreterPlaybackGateUntilRef.current = audioContext.currentTime;
+      liveInterpreterPlaybackQueueRef.current = [];
+      if (liveInterpreterCurrentAudioRef.current) {
+        liveInterpreterCurrentAudioRef.current.pause();
+        liveInterpreterCurrentAudioRef.current.src = "";
+        liveInterpreterCurrentAudioRef.current = null;
+      }
+      liveInterpreterBlockMicUntilRef.current = nowMs();
       const playbackSampleRate = audioContext.sampleRate || LIVE_INTERPRETER_OUTPUT_FALLBACK_RATE;
       const desiredAzureOutputRate = closestSupportedOutputSampleRate(playbackSampleRate);
       liveInterpreterOutputSampleRateRef.current = desiredAzureOutputRate;
@@ -968,19 +997,7 @@ export default function App(): JSX.Element {
       silenceGain.connect(audioContext.destination);
       source.connect(processor);
 
-      const destination = audioContext.createMediaStreamDestination();
-      callDestinationRef.current = destination;
-
-      const remoteAudio = remoteAudioRef.current;
-      if (remoteAudio) {
-        remoteAudio.srcObject = destination.stream;
-        remoteAudio.muted = false;
-        try {
-          await remoteAudio.play();
-        } catch {
-          /* ignore autoplay issues */
-        }
-      }
+      callDestinationRef.current = null;
 
       // Connect to WebSocket for continuous translation
       const selectedTargets = liveInterpreterTargets.length ? liveInterpreterTargets : ["en"];
@@ -1051,45 +1068,29 @@ export default function App(): JSX.Element {
             if (audioB64) {
               try {
                 const audioBytes = base64ToUint8Array(audioB64);
-                const float32 = pcm16BytesToFloat32(audioBytes);
+                const reportedSampleRate =
+                  typeof data.audioSampleRate === "number" && data.audioSampleRate > 0
+                    ? data.audioSampleRate
+                    : liveInterpreterOutputSampleRateRef.current;
+                liveInterpreterOutputSampleRateRef.current = reportedSampleRate;
 
-                if (float32.length) {
-                  if (typeof data.audioSampleRate === "number" && data.audioSampleRate > 0) {
-                    liveInterpreterOutputSampleRateRef.current = data.audioSampleRate;
-                  }
-                  const sourceSampleRate =
-                    typeof data.audioSampleRate === "number" && data.audioSampleRate > 0
-                      ? data.audioSampleRate
-                      : liveInterpreterOutputSampleRateRef.current;
-                  const buffer = await renderBufferAtContextRate(audioContext, float32, sourceSampleRate);
-                  console.debug("Live Interpreter chunk", {
-                    reportedSampleRate: sourceSampleRate,
-                    bufferSampleRate: buffer.sampleRate,
-                    durationSec: Number(buffer.duration.toFixed(3)),
-                    frameCount: buffer.length,
-                  });
-                  liveInterpreterOutputSampleRateRef.current = buffer.sampleRate;
-                  const bufferSource = audioContext.createBufferSource();
-                  bufferSource.buffer = buffer;
-                  bufferSource.connect(destination);
-                  const startAt = Math.max(callPlaybackTimeRef.current, audioContext.currentTime);
-                  bufferSource.start(startAt);
-                  callPlaybackTimeRef.current = startAt + buffer.duration;
-                  liveInterpreterActivePlaybackCountRef.current += 1;
-                  const gateUntil = startAt + buffer.duration + 0.2;
-                  if (gateUntil > liveInterpreterPlaybackGateUntilRef.current) {
-                    liveInterpreterPlaybackGateUntilRef.current = gateUntil;
-                  }
-                  bufferSource.onended = () => {
-                    liveInterpreterActivePlaybackCountRef.current = Math.max(
-                      0,
-                      liveInterpreterActivePlaybackCountRef.current - 1,
-                    );
-                    if (audioContext.currentTime >= liveInterpreterPlaybackGateUntilRef.current) {
-                      liveInterpreterPlaybackGateUntilRef.current = audioContext.currentTime;
-                    }
-                  };
+                const blob = new Blob([audioBytes], { type: "audio/wav" });
+                const approxBytes = Math.max(0, blob.size - 44);
+                const approxDurationSec =
+                  reportedSampleRate > 0 ? approxBytes / (reportedSampleRate * 2) : blob.size / 32000;
+
+                console.debug("Live Interpreter chunk", {
+                  reportedSampleRate,
+                  approxDuration: Number(approxDurationSec.toFixed(3)),
+                  byteLength: blob.size,
+                });
+
+                const releaseAt = nowMs() + approxDurationSec * 1000 + 200;
+                if (releaseAt > liveInterpreterBlockMicUntilRef.current) {
+                  liveInterpreterBlockMicUntilRef.current = releaseAt;
                 }
+
+                enqueueLiveInterpreterAudio(blob, reportedSampleRate);
               } catch (audioError) {
                 console.error("Error playing audio:", audioError);
               }
@@ -1128,10 +1129,7 @@ export default function App(): JSX.Element {
           return;
         }
 
-        if (
-          liveInterpreterActivePlaybackCountRef.current > 0 ||
-          audioContext.currentTime < liveInterpreterPlaybackGateUntilRef.current
-        ) {
+        if (nowMs() < liveInterpreterBlockMicUntilRef.current) {
           return;
         }
 
@@ -1178,7 +1176,15 @@ export default function App(): JSX.Element {
       setCallStatus("idle");
       resetRealtimeState();
     }
-  }, [callProvider, callStatus, liveInterpreterTargets, resetRealtimeState, setError, stopLiveInterpreterWebSocket]);
+  }, [
+    callProvider,
+    callStatus,
+    enqueueLiveInterpreterAudio,
+    liveInterpreterTargets,
+    resetRealtimeState,
+    setError,
+    stopLiveInterpreterWebSocket,
+  ]);
 
   const stopCall = useCallback(() => {
     if (callProvider === "live-interpreter") {
@@ -1658,7 +1664,7 @@ export default function App(): JSX.Element {
       callStreamingStateRef.current = "idle";
       callAwaitingResponseRef.current = false;
       callHasSpeechSinceCommitRef.current = false;
-      callLastVoiceActivityRef.current = performance.now();
+      callLastVoiceActivityRef.current = nowMs();
 
       try {
         await audioContext.resume();
@@ -1859,7 +1865,7 @@ export default function App(): JSX.Element {
           rms,
         });
 
-        const now = performance.now();
+        const now = nowMs();
         if (rms > SILENCE_THRESHOLD) {
           callLastVoiceActivityRef.current = now;
           callHasSpeechSinceCommitRef.current = true;

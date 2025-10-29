@@ -395,7 +395,19 @@ class LiveInterpreterStreamingSession:
             if sample_rate is None:
                 sample_rate = self.config.output_sample_rate or 16000
 
-            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
+            wav_buffer = io.BytesIO()
+            try:
+                with wave.open(wav_buffer, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(pcm_bytes)
+                wav_bytes = wav_buffer.getvalue()
+            except (wave.Error, RuntimeError) as exc:
+                logger.warning("Failed to wrap PCM into WAV: %s", exc)
+                wav_bytes = pcm_bytes
+
+            audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
 
             logger.info(
                 "🔊 Audio synthesized: raw=%d bytes, pcm=%d bytes, sample_rate=%s",
@@ -407,13 +419,13 @@ class LiveInterpreterStreamingSession:
             self._audio_queue.put({
                 "type": "audio",
                 "data": audio_b64,
-                "size": len(pcm_bytes),
+                "size": len(wav_bytes),
                 "sampleRate": sample_rate,
             })
 
             self._event_queue.put(TranslationEvent(
                 event_type='audio',
-                audio_data=pcm_bytes,
+                audio_data=wav_bytes,
                 audio_base64=audio_b64,
                 audio_sample_rate=sample_rate,
             ))
