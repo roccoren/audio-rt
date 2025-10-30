@@ -1,4 +1,7 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AccountInfo, InteractionRequiredAuthError, InteractionStatus } from "@azure/msal-browser";
+import { useMsal } from "@azure/msal-react";
+import { azureAuthEnabled, allowedTenantIds, loginRequest, tenantRestrictionEnabled } from "./authConfig";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const TARGET_SAMPLE_RATE = 24000;
@@ -424,6 +427,16 @@ function pcm16ChunksToWavBlob(chunks: Uint8Array[], sampleRate: number): Blob | 
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+const extractErrorMessage = (error: unknown): string => {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim().length) {
+    return error;
+  }
+  return "Unexpected authentication error.";
+};
+
 export default function App(): JSX.Element {
   const [mode, setMode] = useState<ConversationMode>("voice");
   const [callTransport, setCallTransport] = useState<CallTransport>("webrtc");
@@ -439,6 +452,262 @@ export default function App(): JSX.Element {
     Record<string, { text: string; isFinal: boolean; timestamp: string }>
   >({});
   const [liveInterpreterTargets, setLiveInterpreterTargets] = useState<string[]>(["zh", "en"]);
+
+  const { instance, accounts, inProgress } = useMsal();
+  const isAuthEnabled = azureAuthEnabled;
+  const [activeAccount, setActiveAccount] = useState<AccountInfo | null>(() =>
+    isAuthEnabled ? instance.getActiveAccount() : null,
+  );
+  const [authError, setAuthError] = useState<string | null>(null);
+  const firstCachedAccount = useMemo(() => accounts[0] ?? null, [accounts]);
+  const [blockedAccount, setBlockedAccount] = useState<AccountInfo | null>(null);
+  const allowedTenantSet = useMemo(
+    () => new Set(allowedTenantIds.map((tenant) => tenant.toLowerCase())),
+    [allowedTenantIds],
+  );
+  const tenantRestrictionActive = tenantRestrictionEnabled && allowedTenantIds.length > 0;
+  const getAccountTenantId = useCallback((account: AccountInfo | null | undefined): string => {
+    if (!account) {
+      return "";
+    }
+    if (account.tenantId) {
+      return account.tenantId.toLowerCase();
+    }
+    const homeAccountId = account.homeAccountId ?? "";
+    const parts = homeAccountId.split(".");
+    if (parts.length >= 2 && parts[1]) {
+      return parts[1].toLowerCase();
+    }
+    return "";
+  }, []);
+  const isTenantAllowed = useCallback(
+    (account: AccountInfo | null | undefined) => {
+      if (!tenantRestrictionActive) {
+        return true;
+      }
+      if (!account) {
+        return true;
+      }
+      const tenantId = getAccountTenantId(account);
+      if (!tenantId) {
+        return false;
+      }
+      return allowedTenantSet.has(tenantId);
+    },
+    [allowedTenantSet, getAccountTenantId, tenantRestrictionActive],
+  );
+  const handleDisallowedAccount = useCallback(
+    (account: AccountInfo | null | undefined) => {
+      const tenantIdRaw = account?.tenantId || getAccountTenantId(account) || "unknown-tenant";
+      const message = `当前租户 (${tenantIdRaw}) 未获授权访问此应用。`;
+      setAuthError(message);
+      setError(message);
+      if (account) {
+        setBlockedAccount(account);
+        if (instance.getActiveAccount()?.homeAccountId === account.homeAccountId) {
+          instance.setActiveAccount(null);
+        }
+      }
+      setActiveAccount(null);
+    },
+    [getAccountTenantId, instance, setError],
+  );
+  const allowedAccount = useMemo(() => {
+    if (!isAuthEnabled) {
+      return null;
+    }
+    const candidate = activeAccount ?? firstCachedAccount;
+    if (!candidate) {
+      return null;
+    }
+    if (!isTenantAllowed(candidate)) {
+      return null;
+    }
+    return candidate;
+  }, [activeAccount, firstCachedAccount, isAuthEnabled, isTenantAllowed]);
+
+  const accountForDisplay = allowedAccount;
+  const isAuthenticated = !isAuthEnabled || Boolean(allowedAccount);
+
+  useEffect(() => {
+    if (!isAuthEnabled) {
+      if (activeAccount) {
+        setActiveAccount(null);
+      }
+      return;
+    }
+    const current = instance.getActiveAccount();
+    const candidate = current ?? firstCachedAccount;
+    if (candidate) {
+      if (!isTenantAllowed(candidate)) {
+        if (!blockedAccount || blockedAccount.homeAccountId !== candidate.homeAccountId) {
+          handleDisallowedAccount(candidate);
+        }
+        return;
+      }
+      if (candidate.homeAccountId !== activeAccount?.homeAccountId) {
+        if (!current) {
+          instance.setActiveAccount(candidate);
+        }
+        setActiveAccount(candidate);
+      }
+      if (blockedAccount) {
+        setBlockedAccount(null);
+      }
+    }
+  }, [
+    activeAccount?.homeAccountId,
+    firstCachedAccount,
+    blockedAccount,
+    handleDisallowedAccount,
+    instance,
+    isAuthEnabled,
+    isTenantAllowed,
+  ]);
+
+  useEffect(() => {
+    if (accountForDisplay) {
+      setAuthError(null);
+    }
+  }, [accountForDisplay]);
+
+  const tokenRequest = useMemo(() => {
+    const scopes = loginRequest.scopes ?? [];
+    return { scopes: [...scopes] };
+  }, []);
+
+  const interactionInProgress = isAuthEnabled && inProgress !== InteractionStatus.None;
+
+  const handleLogin = useCallback(async () => {
+    if (!isAuthEnabled || interactionInProgress) {
+      return;
+    }
+    setAuthError(null);
+    try {
+      const response = await instance.loginPopup({ ...tokenRequest });
+      const nextAccount =
+        response.account ??
+        instance.getActiveAccount() ??
+        instance.getAllAccounts()[0] ??
+        firstCachedAccount ??
+        null;
+      if (nextAccount) {
+        if (!isTenantAllowed(nextAccount)) {
+          handleDisallowedAccount(nextAccount);
+          return;
+        }
+        instance.setActiveAccount(nextAccount);
+        setActiveAccount(nextAccount);
+        if (blockedAccount) {
+          setBlockedAccount(null);
+        }
+      } else {
+        setActiveAccount(null);
+      }
+    } catch (loginError) {
+      setAuthError(extractErrorMessage(loginError));
+    }
+  }, [
+    firstCachedAccount,
+    handleDisallowedAccount,
+    blockedAccount,
+    instance,
+    interactionInProgress,
+    isAuthEnabled,
+    isTenantAllowed,
+    tokenRequest,
+  ]);
+
+  const handleLogout = useCallback(async () => {
+    if (!isAuthEnabled || interactionInProgress) {
+      return;
+    }
+    setAuthError(null);
+    try {
+      const account = instance.getActiveAccount() ?? blockedAccount ?? null;
+      await instance.logoutPopup({ account: account ?? undefined });
+      setActiveAccount(null);
+      setBlockedAccount(null);
+      setError(null);
+    } catch (logoutError) {
+      setAuthError(extractErrorMessage(logoutError));
+    }
+  }, [blockedAccount, instance, interactionInProgress, isAuthEnabled]);
+
+  const acquireAccessToken = useCallback(async () => {
+    if (!isAuthEnabled) {
+      return null;
+    }
+    const account = instance.getActiveAccount() ?? firstCachedAccount;
+    if (!isTenantAllowed(account)) {
+      handleDisallowedAccount(account);
+      const tenantIdRaw = account?.tenantId || getAccountTenantId(account) || "unknown-tenant";
+      throw new Error(`当前租户 (${tenantIdRaw}) 未获授权访问此应用。`);
+    }
+    if (!account) {
+      const message = "请先使用组织账号登录。";
+      setAuthError(message);
+      setError(message);
+      throw new Error(message);
+    }
+    try {
+      const response = await instance.acquireTokenSilent({
+        ...tokenRequest,
+        account,
+      });
+      setError(null);
+      setAuthError(null);
+      return response.accessToken;
+    } catch (silentError) {
+      if (silentError instanceof InteractionRequiredAuthError) {
+        try {
+          const interactiveResponse = await instance.acquireTokenPopup({
+            ...tokenRequest,
+            account,
+          });
+          setError(null);
+          setAuthError(null);
+          return interactiveResponse.accessToken;
+        } catch (interactiveError) {
+          const message = extractErrorMessage(interactiveError);
+          setAuthError(message);
+          setError(message);
+          throw interactiveError;
+        }
+      }
+      const message = extractErrorMessage(silentError);
+      setAuthError(message);
+      setError(message);
+      throw silentError;
+    }
+  }, [
+    firstCachedAccount,
+    getAccountTenantId,
+    handleDisallowedAccount,
+    instance,
+    isAuthEnabled,
+    isTenantAllowed,
+    setError,
+    tokenRequest,
+  ]);
+
+  const fetchWithAuth = useCallback(
+    async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const headers = new Headers(init.headers ?? {});
+      if (isAuthEnabled) {
+        const token = await acquireAccessToken();
+        if (!token) {
+          throw new Error("未能获取访问令牌。");
+        }
+        headers.set("Authorization", `Bearer ${token}`);
+      }
+      return fetch(input, {
+        ...init,
+        headers,
+      });
+    },
+    [acquireAccessToken, isAuthEnabled],
+  );
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -503,6 +772,9 @@ export default function App(): JSX.Element {
   );
 
   const statusText = useMemo(() => {
+    if (isAuthEnabled && authError) {
+      return authError;
+    }
     if (error) {
       return error;
     }
@@ -537,7 +809,7 @@ export default function App(): JSX.Element {
       return "Type something for Zara to riff on.";
     }
     return "Ready to send.";
-  }, [callProvider, callStatus, capturedAudio, error, isRecording, loading, mode, text]);
+  }, [authError, callProvider, callStatus, capturedAudio, error, isAuthEnabled, isRecording, loading, mode, text]);
 
   useEffect(() => {
     return () => {
@@ -805,7 +1077,7 @@ export default function App(): JSX.Element {
     const timestamp = new Date().toISOString();
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/translate`, {
+      const response = await fetchWithAuth(`${API_BASE_URL}/api/translate`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1010,9 +1282,22 @@ export default function App(): JSX.Element {
         output_sample_rate: String(desiredAzureOutputRate),
         browser_sample_rate: String(Math.round(playbackSampleRate)),
       });
+      if (isAuthEnabled) {
+        try {
+          const token = await acquireAccessToken();
+          if (!token) {
+            throw new Error("未能获取访问令牌。");
+          }
+          wsParams.set("access_token", token);
+        } catch (authErr) {
+          setError("需要登录后才能使用 Live Interpreter。");
+          setCallStatus("idle");
+          throw authErr;
+        }
+      }
       const wsUrl = `${wsProtocol}//${apiUrl.host}/api/live-interpreter/ws?${wsParams.toString()}`;
-      
-      console.log("Connecting to Live Interpreter WebSocket:", wsUrl);
+      const loggedUrl = isAuthEnabled ? wsUrl.replace(/access_token=[^&]+/, "access_token=***") : wsUrl;
+      console.log("Connecting to Live Interpreter WebSocket:", loggedUrl);
       const ws = new WebSocket(wsUrl);
       liveInterpreterWsRef.current = ws;
 
@@ -1252,7 +1537,7 @@ export default function App(): JSX.Element {
       }
 
       try {
-        const response = await fetch(`${API_BASE_URL}/api/respond`, {
+        const response = await fetchWithAuth(`${API_BASE_URL}/api/respond`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1303,7 +1588,7 @@ export default function App(): JSX.Element {
     setError(null);
     setCallStatus("connecting");
     try {
-      const sessionResponse = await fetch(`${API_BASE_URL}/api/realtime/session`, {
+      const sessionResponse = await fetchWithAuth(`${API_BASE_URL}/api/realtime/session`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1414,7 +1699,7 @@ export default function App(): JSX.Element {
         throw new Error("Failed to obtain local SDP.");
       }
 
-      const handshakeResponse = await fetch(`${API_BASE_URL}/api/realtime/handshake`, {
+      const handshakeResponse = await fetchWithAuth(`${API_BASE_URL}/api/realtime/handshake`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1700,11 +1985,28 @@ export default function App(): JSX.Element {
         sessionInfoRef.current = null;
         const apiUrl = new URL(API_BASE_URL);
         const wsProtocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${wsProtocol}//${apiUrl.host}/api/voicelive/ws`;
-        console.debug("VoiceLive bridge websocket url", wsUrl);
+        const wsBaseUrl = `${wsProtocol}//${apiUrl.host}/api/voicelive/ws`;
+        let wsUrl = wsBaseUrl;
+        if (isAuthEnabled) {
+          try {
+            const token = await acquireAccessToken();
+            if (!token) {
+              throw new Error("未能获取访问令牌。");
+            }
+            const url = new URL(wsBaseUrl);
+            url.searchParams.set("access_token", token);
+            wsUrl = url.toString();
+          } catch (authErr) {
+            setError("需要登录后才能启动 VoiceLive 通话。");
+            setCallStatus("idle");
+            throw authErr;
+          }
+        }
+        const loggedWsUrl = isAuthEnabled ? wsUrl.replace(/access_token=[^&]+/, "access_token=***") : wsUrl;
+        console.debug("VoiceLive bridge websocket url", loggedWsUrl);
         ws = new WebSocket(wsUrl);
       } else {
-        const sessionResponse = await fetch(`${API_BASE_URL}/api/realtime/session`, {
+        const sessionResponse = await fetchWithAuth(`${API_BASE_URL}/api/realtime/session`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -2027,6 +2329,66 @@ export default function App(): JSX.Element {
   const hasPendingActions =
     loading || (mode === "voice" && isRecording) || (mode === "call" && callStatus === "connecting");
 
+  const showLoginGate = isAuthEnabled && !isAuthenticated;
+  const loginGateAccount = blockedAccount ?? instance.getActiveAccount() ?? firstCachedAccount;
+
+  if (showLoginGate) {
+    return (
+      <div className="app-shell">
+        <header className="app-header">
+          <div>
+            <h1>Zara Voice</h1>
+            <p>请使用组织的 Microsoft 账号登录后再继续体验语音对话。</p>
+            {authError && (
+              <p className="error" role="alert" style={{ marginTop: "0.75rem" }}>
+                {authError}
+              </p>
+            )}
+          </div>
+          {loginGateAccount && (
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <span style={{ fontSize: "0.875rem", color: "rgba(226, 232, 240, 0.85)" }}>
+                {loginGateAccount.name || loginGateAccount.username}
+              </span>
+              <button
+                type="button"
+                className="send-btn"
+                onClick={handleLogout}
+                disabled={interactionInProgress}
+              >
+                退出登录
+              </button>
+            </div>
+          )}
+        </header>
+
+        <div className="controls" style={{ justifyContent: "center" }}>
+          <div className="input-card" style={{ maxWidth: "480px" }}>
+            <h2>登录以继续</h2>
+            <p style={{ color: "rgba(226, 232, 240, 0.75)", lineHeight: 1.6 }}>
+              登录后可以访问所有对话模式，包括实时通话和 Live Interpreter 翻译功能。
+            </p>
+            <div className="button-row" style={{ marginTop: "1.5rem" }}>
+              <button
+                type="button"
+                className="send-btn primary"
+                onClick={handleLogin}
+                disabled={interactionInProgress}
+              >
+                使用 Microsoft 登录
+              </button>
+            </div>
+            {authError && (
+              <p className="error" role="alert" style={{ marginTop: "1rem" }}>
+                {authError}
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -2034,18 +2396,35 @@ export default function App(): JSX.Element {
           <h1>Zara Voice</h1>
           <p>文字、语音、实时模式随心切换，Zara 都会用语音陪你聊。</p>
         </div>
-        <button
-          className="send-btn"
-          onClick={() => {
-            if (callActive) {
-              stopCall();
-            }
-            setHistory([]);
-          }}
-          disabled={!history.length}
-        >
-          Clear Chat
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+          {isAuthEnabled && accountForDisplay && (
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <span style={{ fontSize: "0.875rem", color: "rgba(226, 232, 240, 0.85)" }}>
+                {accountForDisplay.name || accountForDisplay.username}
+              </span>
+              <button
+                type="button"
+                className="send-btn"
+                onClick={handleLogout}
+                disabled={interactionInProgress}
+              >
+                退出登录
+              </button>
+            </div>
+          )}
+          <button
+            className="send-btn"
+            onClick={() => {
+              if (callActive) {
+                stopCall();
+              }
+              setHistory([]);
+            }}
+            disabled={!history.length}
+          >
+            Clear Chat
+          </button>
+        </div>
       </header>
 
       <div className="controls">

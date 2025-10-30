@@ -66,6 +66,47 @@ Create the web env file (update the URL if the backend runs elsewhere):
 cp .env.template .env
 ```
 
+### Azure AD Authentication (Optional)
+
+The backend can validate Azure AD (Entra ID) bearer tokens for every API and WebSocket call. To enable it:
+
+1. Register a **backend/API** application in Entra ID, expose an API scope (for example `api://<backend-app-id>/.default`), and capture its **Application (client) ID** and **Directory (tenant) ID**.
+2. Register a **frontend (SPA)** application allowed to request that scope. Add your local URL (e.g. `http://localhost:5173`) to its redirect URIs.
+3. Update `.env` with the backend identifiers:
+
+   ```ini
+   AZURE_AD_TENANT_ID="<tenant-id>"
+   AZURE_AD_CLIENT_ID="<backend-app-client-id>"
+   AZURE_AD_API_AUDIENCE="api://<backend-app-client-id>/.default"
+   AZURE_AD_ALLOWED_CLIENT_IDS="<frontend-app-client-id>"
+   ```
+
+   You can also specify optional enforcement knobs such as `AZURE_AD_REQUIRED_SCOPES` or `AZURE_AD_REQUIRED_ROLES`.
+
+4. Update `web/.env` with the SPA information:
+
+   ```bash
+   VITE_AAD_CLIENT_ID=<frontend-app-client-id>
+   VITE_AAD_TENANT_ID=<tenant-id>
+   VITE_AAD_API_SCOPE=api://<backend-app-client-id>/.default
+   # VITE_AAD_REDIRECT_URI=http://localhost:5173
+   ```
+
+With these settings in place the web client prompts users to sign in, attaches the bearer token to REST calls, and includes it in WebSocket upgrade requests. The FastAPI service validates the token (audience, issuer, scopes, allowed clients) before processing any request. Set `AZURE_AD_AUTH_DISABLED=1` (and/or `VITE_AAD_AUTH_DISABLED=1`) to bypass authentication for local experimentation.
+
+**Multi-tenant callers (optional).** If you want to allow users from other Azure AD tenants:
+
+- Switch both the SPA and API registrations to “Accounts in any organizational directory (multi-tenant)”.
+- Set the authority/tenant hints to the shared endpoint, e.g.
+  - Backend: `AZURE_AD_AUTHORITY="https://login.microsoftonline.com/common"` (omit `AZURE_AD_ISSUER` so the backend accepts tenant-specific issuers).
+  - Frontend: `VITE_AAD_TENANT_ID=common` (or set `VITE_AAD_AUTHORITY` explicitly).
+- Optionally restrict which external tenants may sign in by supplying matching lists on both sides:
+  - Backend: `AZURE_AD_ALLOWED_TENANT_IDS="contoso-tenant-guid,partner-tenant-guid"`
+  - Frontend: `VITE_AAD_ALLOWED_TENANTS=contoso-tenant-guid,partner-tenant-guid`
+- When your API exposes both resource (`api://zara.hereis.app`) and `.default` audiences, add the plain value to `AZURE_AD_ADDITIONAL_AUDIENCES` so both access tokens pass validation.
+- Add every trusted tenant ID to `AZURE_AD_ALLOWED_TENANT_IDS` to lock down who can call the API, and include their client IDs in `AZURE_AD_ALLOWED_CLIENT_IDS` if they use separate SPA registrations.
+- Administrators in each external tenant must grant consent to the exposed API scope (`api://<backend-app-id>/.default`) before their users can authenticate successfully.
+
 ### Weather Lookup Helper (Optional)
 
 To enable the async `lookup_current_weather` helper in `src/weather_lookup.py`, supply a WeatherAPI.com key:

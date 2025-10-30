@@ -5,11 +5,11 @@ import json
 import logging
 import threading
 from functools import lru_cache
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
@@ -51,7 +51,7 @@ from src.live_interpreter_streaming import (
     load_streaming_config_from_env,
 )
 from src.weather_lookup import WeatherLookupError, lookup_current_weather
-
+from .auth import AuthenticationError, get_current_user_claims, require_websocket_auth
 
 app = FastAPI(title="Zara Voice Service")
 app.add_middleware(
@@ -210,7 +210,10 @@ async def healthcheck() -> dict[str, str]:
 
 
 @app.post("/api/respond", response_model=RespondResponse)
-async def respond(payload: RespondRequest) -> RespondResponse:
+async def respond(
+    payload: RespondRequest,
+    _claims: Optional[dict[str, Any]] = Depends(get_current_user_claims),
+) -> RespondResponse:
     if not payload.text and not payload.audio_base64:
         raise HTTPException(status_code=400, detail="Provide text or audioBase64 in the request.")
 
@@ -248,7 +251,10 @@ async def respond(payload: RespondRequest) -> RespondResponse:
 
 
 @app.post("/api/translate", response_model=TranslateResponse)
-async def translate(payload: TranslateRequest) -> TranslateResponse:
+async def translate(
+    payload: TranslateRequest,
+    _claims: Optional[dict[str, Any]] = Depends(get_current_user_claims),
+) -> TranslateResponse:
     if not payload.audio_base64:
         raise HTTPException(status_code=400, detail="audioBase64 is required for translation.")
     if payload.sample_rate <= 0:
@@ -772,6 +778,13 @@ async def _consume_voicelive_messages(
 
 @app.websocket("/api/voicelive/ws")
 async def voicelive_bridge(websocket: WebSocket) -> None:
+    try:
+        _claims = await require_websocket_auth(websocket)
+    except AuthenticationError as exc:
+        logger.warning("Rejecting unauthorized VoiceLive websocket: %s", exc)
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
     await websocket.accept()
     raw_query = websocket.scope.get("query_string") or b""
     query_params = dict(parse_qsl(raw_query.decode("utf-8"))) if raw_query else {}
@@ -905,7 +918,10 @@ async def voicelive_bridge(websocket: WebSocket) -> None:
             pass
 
 @app.post("/api/realtime/handshake", response_model=RealtimeHandshakeResponse)
-async def realtime_handshake(payload: RealtimeHandshakeRequest) -> RealtimeHandshakeResponse:
+async def realtime_handshake(
+    payload: RealtimeHandshakeRequest,
+    _claims: Optional[dict[str, Any]] = Depends(get_current_user_claims),
+) -> RealtimeHandshakeResponse:
     offer_sdp = payload.offer_sdp or ""
     if not offer_sdp.strip():
         raise HTTPException(status_code=400, detail="SDP offer must be provided.")
@@ -970,7 +986,10 @@ async def realtime_handshake(payload: RealtimeHandshakeRequest) -> RealtimeHands
 
 
 @app.post("/api/realtime/session", response_model=RealtimeSessionResponse)
-async def realtime_session(payload: RealtimeSessionRequest) -> RealtimeSessionResponse:
+async def realtime_session(
+    payload: RealtimeSessionRequest,
+    _claims: Optional[dict[str, Any]] = Depends(get_current_user_claims),
+) -> RealtimeSessionResponse:
     if payload.provider == "voicelive":
         return await _create_voicelive_session(payload)
 
@@ -1150,6 +1169,13 @@ streaming_sessions: dict[str, LiveInterpreterStreamingSession] = {}
 @app.websocket("/api/live-interpreter/ws")
 async def live_interpreter_websocket(websocket: WebSocket) -> None:
     """WebSocket endpoint for continuous Live Interpreter translation."""
+    try:
+        _claims = await require_websocket_auth(websocket)
+    except AuthenticationError as exc:
+        logger.warning("Rejecting unauthorized Live Interpreter websocket: %s", exc)
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
     await websocket.accept()
     
     session_id = f"session_{id(websocket)}"

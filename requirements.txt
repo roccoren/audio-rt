@@ -11,3 +11,4 @@ aiohttp>=3.9.0
 azure-cognitiveservices-speech>=1.37.0
 azure-ai-voicelive>=1.0.0b1
 python-dotenv>=1.0.0
+PyJWT[crypto]>=2.9.0
